@@ -4,11 +4,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use outpost::stun::attribute::{
-    DATA, ERROR_CODE, NONCE, REALM, REQUESTED_TRANSPORT, USERNAME, XOR_PEER_ADDRESS,
-    XOR_RELAYED_ADDRESS,
+    CHANNEL_NUMBER, DATA, ERROR_CODE, NONCE, REALM, REQUESTED_TRANSPORT, USERNAME,
+    XOR_PEER_ADDRESS, XOR_RELAYED_ADDRESS,
 };
 use outpost::stun::{
-    self, ALLOCATE, BINDING, Builder, CREATE_PERMISSION, Class, Message, SEND, long_term_key,
+    self, ALLOCATE, BINDING, Builder, CHANNEL_BIND, CREATE_PERMISSION, Class, Message, SEND,
+    long_term_key,
 };
 use outpost::{Config, Credentials, Outpost};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -219,9 +220,20 @@ impl Line {
             }
             Line::Tcp(stream) => {
                 let mut message = vec![0; stun::HEADER_LEN];
-                within(stream.read_exact(&mut message)).await.unwrap();
-                message.resize(stun::message_length(&message).unwrap(), 0);
-                within(stream.read_exact(&mut message[stun::HEADER_LEN..]))
+                within(stream.read_exact(&mut message[..4])).await.unwrap();
+                let length = match stun::channel_data_length(&message) {
+                    Some(length) => {
+                        message.truncate(4);
+                        length
+                    }
+                    None => {
+                        within(stream.read_exact(&mut message[4..])).await.unwrap();
+                        stun::message_length(&message).unwrap()
+                    }
+                };
+                let read = message.len();
+                message.resize(length, 0);
+                within(stream.read_exact(&mut message[read..]))
                     .await
                     .unwrap();
                 message
@@ -269,6 +281,17 @@ impl Line {
             .unwrap()
             .xor_address(XOR_RELAYED_ADDRESS)
             .unwrap()
+    }
+
+    async fn bind(&mut self, room: &Credentials, number: u16, peer: SocketAddr) {
+        let reply = self
+            .ask_logged_in(room, |transaction| {
+                Builder::new(CHANNEL_BIND, Class::Request, transaction)
+                    .attribute(CHANNEL_NUMBER, &[(number >> 8) as u8, number as u8, 0, 0])
+                    .xor_address(XOR_PEER_ADDRESS, peer)
+            })
+            .await;
+        assert_eq!(Message::parse(&reply).unwrap().class(), Class::Success);
     }
 
     async fn permit(&mut self, room: &Credentials, peer: SocketAddr) {
@@ -471,4 +494,46 @@ async fn a_new_connection_from_a_reused_address_is_served_whatever_the_old_one_d
         assert_eq!(Message::parse(&binding).unwrap().class(), Class::Success);
         reset(new);
     }
+}
+
+#[tokio::test]
+async fn channel_data_crosses_between_udp_and_tcp_padded_only_over_tcp() {
+    let outpost = start("test").await;
+    let mut over_udp = Line::udp(outpost.udp).await;
+    let mut over_tcp = Line::tcp(outpost.tcp).await;
+    let udp_relayed = over_udp.relayed(&outpost.room).await;
+    let tcp_relayed = over_tcp.relayed(&outpost.room).await;
+    over_udp.bind(&outpost.room, 0x4001, tcp_relayed).await;
+    over_tcp.bind(&outpost.room, 0x4002, udp_relayed).await;
+
+    over_udp
+        .put(&stun::channel_data(0x4001, b"abc", false))
+        .await;
+    assert_eq!(
+        over_tcp.next().await,
+        stun::channel_data(0x4002, b"abc", true)
+    );
+
+    // Padded over TCP both ways; the stream must still be in step for what follows.
+    over_tcp
+        .put(&stun::channel_data(0x4002, b"defgh", true))
+        .await;
+    assert_eq!(
+        over_udp.next().await,
+        stun::channel_data(0x4001, b"defgh", false)
+    );
+    let binding = over_tcp.ask(&stun::binding_request(TRANSACTION)).await;
+    assert_eq!(Message::parse(&binding).unwrap().transaction(), TRANSACTION);
+
+    // The smallest and the largest ChannelData a TCP connection takes.
+    let largest = vec![7; 2044];
+    for data in [&[][..], &largest] {
+        over_tcp.put(&stun::channel_data(0x4002, data, true)).await;
+        assert_eq!(
+            over_udp.next().await,
+            stun::channel_data(0x4001, data, false)
+        );
+    }
+    let binding = over_tcp.ask(&stun::binding_request(TRANSACTION)).await;
+    assert_eq!(Message::parse(&binding).unwrap().transaction(), TRANSACTION);
 }

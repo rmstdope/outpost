@@ -2,6 +2,7 @@
 //! their MESSAGE-INTEGRITY and FINGERPRINT.
 
 use std::net::{IpAddr, SocketAddr};
+use std::ops::RangeInclusive;
 
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
@@ -304,6 +305,51 @@ impl Builder {
 
 pub fn binding_request(transaction: Transaction) -> Vec<u8> {
     Builder::new(BINDING, Class::Request, transaction).build()
+}
+
+/// The channel numbers a ChannelData message can carry (RFC 8656 §12).
+pub const CHANNELS: RangeInclusive<u16> = 0x4000..=0x4FFF;
+pub const CHANNEL_DATA_HEADER_LEN: usize = 4;
+
+/// Whether `bytes` start like a ChannelData message rather than a STUN one: a first byte from
+/// 64 to 79 (RFC 8656 §12, Table 3).
+pub fn is_channel_data(bytes: &[u8]) -> bool {
+    bytes
+        .first()
+        .is_some_and(|first| (0x40..=0x4F).contains(first))
+}
+
+/// How many bytes the ChannelData message whose header starts `bytes` takes over TCP, where it
+/// is padded to a multiple of four (RFC 8656 §12.5).
+pub fn channel_data_length(bytes: &[u8]) -> Option<usize> {
+    if !is_channel_data(bytes) {
+        return None;
+    }
+    let length = usize::from(u16::from_be_bytes([*bytes.get(2)?, *bytes.get(3)?]));
+    Some(CHANNEL_DATA_HEADER_LEN + length.next_multiple_of(4))
+}
+
+/// Reads `bytes` as one ChannelData message, with or without its padding: the channel number
+/// and the data.
+pub fn parse_channel_data(bytes: &[u8]) -> Option<(u16, &[u8])> {
+    let padded = channel_data_length(bytes)?;
+    let channel = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let length = usize::from(u16::from_be_bytes([bytes[2], bytes[3]]));
+    let end = CHANNEL_DATA_HEADER_LEN + length;
+    (end <= bytes.len() && bytes.len() <= padded)
+        .then(|| (channel, &bytes[CHANNEL_DATA_HEADER_LEN..end]))
+}
+
+/// A ChannelData message, padded to a multiple of four when it goes over TCP.
+pub fn channel_data(channel: u16, data: &[u8], padded: bool) -> Vec<u8> {
+    let mut message = Vec::with_capacity(CHANNEL_DATA_HEADER_LEN + data.len() + 3);
+    message.extend_from_slice(&channel.to_be_bytes());
+    message.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    message.extend_from_slice(data);
+    if padded {
+        message.resize(message.len().next_multiple_of(4), 0);
+    }
+    message
 }
 
 /// The length of the STUN message whose header starts `bytes`, if it is a STUN header: the top
@@ -634,6 +680,47 @@ mod tests {
         let value = message.attribute(ERROR_CODE).unwrap();
         assert_eq!(value[..4], [0, 0, 4, 20]);
         assert_eq!(&value[4..], b"Unknown Attribute");
+    }
+
+    #[test]
+    fn channel_data_is_told_from_stun_by_its_first_byte() {
+        assert!(is_channel_data(&[0x40, 0, 0, 0]));
+        assert!(is_channel_data(&[0x4F, 0xFF, 0, 0]));
+        for first in [0x00, 0x3F, 0x50, 0x7F, 0x80, 0xFF] {
+            assert!(!is_channel_data(&[first, 0, 0, 0]), "{first:#x}");
+        }
+        assert!(!is_channel_data(&[]));
+        assert!(!is_channel_data(&binding_request(SAMPLE)));
+    }
+
+    #[test]
+    fn channel_data_reads_back_with_or_without_padding() {
+        let unpadded = channel_data(0x4001, b"abc", false);
+        assert_eq!(unpadded, hex("4001 0003 616263"));
+        let padded = channel_data(0x4001, b"abc", true);
+        assert_eq!(padded, hex("4001 0003 61626300"));
+        assert_eq!(channel_data_length(&padded[..4]), Some(8));
+        for bytes in [&unpadded, &padded] {
+            assert_eq!(parse_channel_data(bytes), Some((0x4001, &b"abc"[..])));
+        }
+        assert_eq!(
+            parse_channel_data(&channel_data(0x4FFF, b"", true)),
+            Some((0x4FFF, &b""[..]))
+        );
+    }
+
+    #[test]
+    fn channel_data_that_is_short_long_or_reserved_is_refused() {
+        let mut too_long = channel_data(0x4001, b"abc", true);
+        too_long.push(0);
+        for bytes in [
+            &hex("4001 0004 616263")[..], // shorter than it says
+            &too_long,                    // more than its padding
+            &hex("5000 0000"),            // a reserved first byte
+            &hex("4001 00"),              // not even a header
+        ] {
+            assert_eq!(parse_channel_data(bytes), None, "{bytes:02x?}");
+        }
     }
 
     #[test]
