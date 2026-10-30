@@ -50,7 +50,14 @@ pub async fn serve_udp(socket: UdpSocket) -> io::Result<()> {
     // Larger than any datagram a browser sends; a longer one is cut short and then refused.
     let mut datagram = [0; 2048];
     loop {
-        let (size, from) = socket.recv_from(&mut datagram).await?;
+        let (size, from) = match socket.recv_from(&mut datagram).await {
+            Ok(received) => received,
+            // Such as an ICMP error for an earlier reply: the listener must outlive it.
+            Err(error) => {
+                tracing::warn!("receiving on UDP failed: {error}");
+                continue;
+            }
+        };
         if let Some(reply) = answer(&datagram[..size], from) {
             // A reply that cannot be sent is the client's loss, not the listener's.
             let _ = socket.send_to(&reply, from).await;

@@ -16,6 +16,7 @@ pub const BINDING: u16 = 0x001;
 pub mod attribute {
     pub const USERNAME: u16 = 0x0006;
     pub const MESSAGE_INTEGRITY: u16 = 0x0008;
+    pub const MESSAGE_INTEGRITY_SHA256: u16 = 0x001C;
     pub const ERROR_CODE: u16 = 0x0009;
     pub const UNKNOWN_ATTRIBUTES: u16 = 0x000A;
     pub const REALM: u16 = 0x0014;
@@ -25,7 +26,9 @@ pub mod attribute {
     pub const FINGERPRINT: u16 = 0x8028;
 }
 
-use attribute::{ERROR_CODE, FINGERPRINT, MESSAGE_INTEGRITY, XOR_MAPPED_ADDRESS};
+use attribute::{
+    ERROR_CODE, FINGERPRINT, MESSAGE_INTEGRITY, MESSAGE_INTEGRITY_SHA256, XOR_MAPPED_ADDRESS,
+};
 
 const FINGERPRINT_XOR: u32 = 0x5354_554E;
 const INTEGRITY_LEN: usize = 20;
@@ -100,12 +103,13 @@ impl<'a> Message<'a> {
         self.bytes[8..HEADER_LEN].try_into().unwrap()
     }
 
-    /// The attributes a receiver may act on: of those after MESSAGE-INTEGRITY, only FINGERPRINT
-    /// counts (§14.5).
+    /// The attributes a receiver may act on (§14.5, §14.6): after MESSAGE-INTEGRITY only
+    /// MESSAGE-INTEGRITY-SHA256 and FINGERPRINT count, and after MESSAGE-INTEGRITY-SHA256 only
+    /// FINGERPRINT.
     pub fn attributes(&self) -> impl Iterator<Item = Attribute<'a>> + use<'a> {
         let bytes = self.bytes;
         let mut offset = HEADER_LEN;
-        let mut after_integrity = false;
+        let mut sealed_by = None;
         std::iter::from_fn(move || {
             while offset < bytes.len() {
                 let kind = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
@@ -117,8 +121,17 @@ impl<'a> Message<'a> {
                     offset,
                 };
                 offset += 4 + length.div_ceil(4) * 4;
-                if !after_integrity || kind == FINGERPRINT {
-                    after_integrity |= kind == MESSAGE_INTEGRITY;
+                let counts = match sealed_by {
+                    None => true,
+                    Some(MESSAGE_INTEGRITY) => {
+                        kind == MESSAGE_INTEGRITY_SHA256 || kind == FINGERPRINT
+                    }
+                    Some(_) => kind == FINGERPRINT,
+                };
+                if counts {
+                    if kind == MESSAGE_INTEGRITY || kind == MESSAGE_INTEGRITY_SHA256 {
+                        sealed_by = Some(kind);
+                    }
                     return Some(attribute);
                 }
             }
@@ -452,8 +465,20 @@ mod tests {
 
     #[test]
     fn a_fingerprint_that_is_not_last_does_not_hold() {
+        // A correct CRC over everything before it, so only its position can reject it.
         let mut bytes = Builder::new(BINDING, Class::Request, SAMPLE).fingerprint();
         bytes.extend_from_slice(&hex("8022 0004 6c617465"));
+        bytes[3] += 8;
+        let crc = fingerprint_of(&bytes[..HEADER_LEN]).to_be_bytes();
+        bytes[24..28].copy_from_slice(&crc);
+        assert_eq!(Message::parse(&bytes).unwrap().fingerprint(), Some(false));
+    }
+
+    #[test]
+    fn only_the_first_of_two_fingerprints_counts() {
+        let mut bytes = Builder::new(BINDING, Class::Request, SAMPLE).fingerprint();
+        let second = bytes[20..28].to_vec();
+        bytes.extend_from_slice(&second);
         bytes[3] += 8;
         assert_eq!(Message::parse(&bytes).unwrap().fingerprint(), Some(false));
     }
@@ -471,6 +496,65 @@ mod tests {
         assert_eq!(message.attribute(SOFTWARE), None);
         assert!(message.integrity_holds(b"key"));
         assert_eq!(message.fingerprint(), Some(true));
+    }
+
+    #[test]
+    fn message_integrity_sha256_counts_after_message_integrity_and_seals_what_follows() {
+        // RFC 8489 §14.5 and §14.6: after MESSAGE-INTEGRITY only MESSAGE-INTEGRITY-SHA256 and
+        // FINGERPRINT count, and after MESSAGE-INTEGRITY-SHA256 only FINGERPRINT.
+        let both = Builder::new(BINDING, Class::Request, SAMPLE)
+            .integrity(b"key")
+            .attribute(MESSAGE_INTEGRITY_SHA256, &[0; 32])
+            .attribute(SOFTWARE, b"late")
+            .fingerprint();
+        let both = Message::parse(&both).unwrap();
+        assert_eq!(both.attribute(MESSAGE_INTEGRITY_SHA256), Some(&[0; 32][..]));
+        assert_eq!(both.attribute(SOFTWARE), None);
+        assert_eq!(both.fingerprint(), Some(true));
+
+        let alone = Builder::new(BINDING, Class::Request, SAMPLE)
+            .attribute(MESSAGE_INTEGRITY_SHA256, &[0; 32])
+            .attribute(SOFTWARE, b"late")
+            .attribute(MESSAGE_INTEGRITY, &[0; 20])
+            .fingerprint();
+        let alone = Message::parse(&alone).unwrap();
+        assert_eq!(alone.attribute(SOFTWARE), None);
+        assert_eq!(alone.attribute(MESSAGE_INTEGRITY), None);
+        assert_eq!(alone.fingerprint(), Some(true));
+    }
+
+    #[test]
+    fn integrity_does_not_hold_without_a_whole_message_integrity() {
+        let none = Builder::new(BINDING, Class::Request, SAMPLE).build();
+        assert!(!Message::parse(&none).unwrap().integrity_holds(b"key"));
+
+        let mut short = Builder::new(BINDING, Class::Request, SAMPLE)
+            .integrity(b"key")
+            .build();
+        short.truncate(short.len() - 4);
+        short[3] -= 4;
+        short[22..24].copy_from_slice(&16u16.to_be_bytes());
+        assert!(!Message::parse(&short).unwrap().integrity_holds(b"key"));
+    }
+
+    #[test]
+    fn an_address_whose_family_and_length_disagree_is_no_address() {
+        for value in [
+            "0002 a147 e112a643",
+            "0001 a147 0113a9fa a5d3f179 bc25f4b5 bed2b9d9",
+            "0000 a147 e112a643",
+            "0003 a147 e112a643",
+            "0001 a1",
+        ] {
+            let bytes = Builder::new(BINDING, Class::Success, SAMPLE)
+                .attribute(XOR_MAPPED_ADDRESS, &hex(value))
+                .build();
+            assert_eq!(
+                Message::parse(&bytes).unwrap().mapped_address(),
+                None,
+                "{value}"
+            );
+        }
     }
 
     #[test]

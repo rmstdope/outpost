@@ -130,6 +130,8 @@ gathered through a local outpost as their STUN server.
   - two allocations per room;
   - allocations per client address;
   - TCP connections per client address, and idle TCP connections closed;
+  - answers per client address over UDP: a spoofed 20-byte Binding request draws a reply about
+    three times its size, so outpost must not be a useful reflector;
   - a bandwidth cap per allocation, with room for bursts;
   - lifetimes;
   - total allocations.
