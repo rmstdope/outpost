@@ -275,6 +275,16 @@ Chrome and Firefox, over UDP and TCP.
 Validation already only renders the Compose config and checks Caddy, so the published port
 needs no change there.
 
+**Done (2026-10-30)** in rmstdope-infra PR #19 (merged as 66ec752):
+- `PUBLISHED_PORTS` in `src/rmstdope_deploy/config.py` lists every published port, keyed by
+  owner: the edge (`_edge`, a name no app can have) and `outpost`. Entries must match exactly.
+- `tests/test_ports.py` checks every definition against it, and bundling a checkout definition
+  refuses an unlisted port. `network_mode`, `extends` and `include` are refused outright.
+- `apps/outpost` is a static-profile app with a reviewed Compose file, `OUTPOST_PUBLIC_IP`
+  set to 136.148.215.87, and alias `outpost-web`.
+- The review noted that the internal API on 8081 is reachable by every container on
+  `rmstdope-proxy`, not only liaison. That is D2's accepted cost; ARCHITECTURE says so.
+
 ### 7. Host changes and first deployment (operator, with your go-ahead)
 
 1. Add UFW rules for `3478/udp` and `3478/tcp` (IPv4; the VPS has no IPv6). Docker's published ports bypass
