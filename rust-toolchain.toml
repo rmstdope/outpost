@@ -1,0 +1,4 @@
+# Keep in step with the build image in the Dockerfile.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]

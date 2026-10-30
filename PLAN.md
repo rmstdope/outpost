@@ -70,8 +70,8 @@ handshakes.
 
 **D5. Written in Rust, like liaison.** It uses tokio, and axum for the small HTTP side. The
 TURN logic is our own, because the room-only rule is not something off-the-shelf servers
-offer. A maintained STUN message crate handles parsing and integrity, chosen with you in step 2.
-The subset needed is small:
+offer. So is the STUN message code (decided 2026-10-30, after the spike handled it in a few
+hundred lines), using small crates only for MD5, HMAC-SHA1 and CRC32. The subset needed is small:
 - STUN Binding (which also makes outpost a STUN server);
 - the TURN requests Allocate, Refresh, CreatePermission and ChannelBind;
 - Send and Data indications, and ChannelData;
@@ -99,18 +99,22 @@ published UDP port, which keeps the players' real addresses. Details are in `spi
 
 Same shape as liaison:
 - HTTP on 8080: `/`, `/healthz`, `/release.json`;
-- the internal API on 8081;
-- UDP and TCP listeners on 3478;
+- UDP and TCP listeners on 3478, answering Binding requests;
 - a non-root Alpine image;
 - CI: fmt, clippy and all tests; build the image, start it and smoke-test it; on `main`, push
   `ghcr.io/rmstdope/outpost` and the `deployment-manifest`.
 
 `/healthz` is healthy only when the UDP listener answers a STUN Binding request.
 
-### 3. STUN Binding (outpost)
+**Done (2026-10-30).** Binding moved here from step 3, because `/healthz` needs it. The internal
+API on 8081 moved to step 5, where it first has something to serve.
 
-Answer Binding requests with the client's public address. Unit tests check the messages
-against RFC 8489's test vectors.
+### 3. STUN conformance (outpost)
+
+The rest of RFC 8489 that step 4 relies on:
+- FINGERPRINT and MESSAGE-INTEGRITY, checked against RFC 5769's test vectors;
+- error responses, including 420 for unknown comprehension-required attributes;
+- ignoring what is not addressed to a server (responses, unknown classes).
 
 ### 4. TURN relay (outpost)
 
@@ -121,6 +125,7 @@ against RFC 8489's test vectors.
 - Limits:
   - two allocations per room;
   - allocations per client address;
+  - TCP connections per client address, and idle TCP connections closed;
   - a bandwidth cap per allocation, with room for bursts;
   - lifetimes;
   - total allocations.
@@ -132,7 +137,7 @@ Logs show only counts, no addresses. Tests:
 
 ### 5. Credentials API (outpost)
 
-`POST /rooms` on 8081 only. It returns `{urls, username, credential}` for one room, valid for
+A second HTTP listener on 8081, with `POST /rooms` only. It returns `{urls, username, credential}` for one room, valid for
 12 hours, and the credentials work only within that room. Port 8081 is never published or
 routed by Caddy.
 

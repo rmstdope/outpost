@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt -- --check
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run all tests
+        run: cargo test --locked
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: rust
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: ghcr.io/rmstdope/outpost:${{ github.sha }}
+          build-args: REVISION=${{ github.sha }}
+      - name: Start production container
+        run: |
+          docker run -d --name outpost-test -p 127.0.0.1:18080:8080 \
+            -p 127.0.0.1:13478:3478/udp -p 127.0.0.1:13478:3478/tcp \
+            ghcr.io/rmstdope/outpost:${{ github.sha }}
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz; then exit 0; fi
+            sleep 1
+          done
+          docker logs outpost-test
+          exit 1
+      - name: Verify release marker, non-root user and the TURN port
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          curl -fsS http://127.0.0.1:18080/release.json \
+            | python3 -c 'import json,os,sys; assert json.load(sys.stdin) == {"revision": os.environ["REVISION"]}'
+          test "$(docker exec outpost-test id -u)" = 10001
+          cargo run --locked --example smoke -- 127.0.0.1:13478
+      - name: Stop container within the grace period
+        run: |
+          start=$(date +%s)
+          docker stop outpost-test
+          test "$(docker inspect outpost-test --format '{{.State.ExitCode}}')" = 0
+          test $(( $(date +%s) - start )) -lt 5
+      - name: Show container logs
+        if: failure()
+        run: docker logs outpost-test || true
+      - name: Remove test container
+        if: always()
+        run: docker rm -f outpost-test || true
+      - name: Export tested image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker save ghcr.io/rmstdope/outpost:${{ github.sha }} -o outpost-container.tar
+          gzip outpost-container.tar
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: outpost-container-image
+          path: outpost-container.tar.gz
+          retention-days: 1
+          overwrite: true
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: container
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - name: Preserve an existing manifest on reruns
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts \
+            --jq '.artifacts[] | select(.name == "deployment-manifest") | {id, expired}' > existing.jsonl
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          matches = [json.loads(line) for line in Path("existing.jsonl").read_text().splitlines()]
+          if matches and (len(matches) != 1 or matches[0]["expired"]):
+              raise SystemExit("Existing deployment manifest is expired or ambiguous; publish a new commit")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"found={'true' if matches else 'false'}\n")
+          PY
+      - uses: actions/download-artifact@v4
+        if: steps.existing.outputs.found != 'true'
+        with:
+          name: outpost-container-image
+      - name: Load tested image
+        if: steps.existing.outputs.found != 'true'
+        run: |
+          gunzip outpost-container.tar.gz
+          docker load --input outpost-container.tar
+      - uses: docker/login-action@v3
+        if: steps.existing.outputs.found != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish tested image and immutable deployment manifest
+        if: steps.existing.outputs.found != 'true'
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          image="ghcr.io/rmstdope/outpost:$REVISION"
+          docker push "$image"
+          IMAGE="$image" python3 - <<'PY'
+          import json, os, subprocess
+          details = json.loads(subprocess.check_output(
+              ["docker", "image", "inspect", os.environ["IMAGE"]]))[0]
+          digest = next(ref for ref in details["RepoDigests"]
+                        if ref.startswith("ghcr.io/rmstdope/outpost@sha256:"))
+          with open("deployment.json", "w") as stream:
+              json.dump({"revision": os.environ["REVISION"], "images": {"web": digest}}, stream)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: steps.existing.outputs.found != 'true'
+        with:
+          name: deployment-manifest
+          path: deployment.json
+          retention-days: 90
