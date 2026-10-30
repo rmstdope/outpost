@@ -81,11 +81,12 @@ jobs:
         working-directory: browser
         run: node relay.mjs http://127.0.0.1:18081/rooms
       - name: Stop container within the grace period
+        # outpost must exit by itself within 5 s of SIGTERM; after that Docker kills it, and the
+        # exit code is 137 instead of 0. How long Docker then takes to remove the published
+        # ports is Docker's, so it is not timed.
         run: |
-          start=$(date +%s)
-          docker stop outpost-test
+          docker stop --time 5 outpost-test
           test "$(docker inspect outpost-test --format '{{.State.ExitCode}}')" = 0
-          test $(( $(date +%s) - start )) -lt 5
       - name: Show container logs
         if: failure()
         run: docker logs outpost-test || true
