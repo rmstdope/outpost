@@ -106,6 +106,26 @@ struct Room {
     allocations: usize,
     /// What is left of the bytes the room may relay (`Limits::room_bandwidth`).
     bandwidth: Bucket,
+    /// When it ends whatever happens (`Limits::room_lifetime`).
+    ends: Instant,
+    /// Since when it has had no allocations (`Limits::room_idle`).
+    idle_since: Instant,
+}
+
+impl Room {
+    /// Whether its credentials still work. Once it is closed, its allocations end too.
+    fn is_open(&self, now: Instant, idle: Duration) -> bool {
+        now < self.ends && (self.allocations > 0 || now < self.idle_since + idle)
+    }
+}
+
+/// Why no room was opened.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RoomRefusal {
+    /// Rooms are being opened faster than `Limits::rooms_opened`.
+    TooSoon,
+    /// `Limits::rooms` are open.
+    Full,
 }
 
 struct Allocation {
@@ -186,6 +206,8 @@ pub struct Relay {
     nonce_secret: [u8; 20],
     epoch: Instant,
     limits: Limits,
+    /// What is left of the rooms that may be opened (`Limits::rooms_opened`).
+    opened: Bucket,
 }
 
 impl Relay {
@@ -198,11 +220,22 @@ impl Relay {
             ports: HashMap::new(),
             nonce_secret: rand::random(),
             epoch: now,
+            opened: Bucket::full(limits.rooms_opened, now),
         }
     }
 
     /// Opens a room and returns the credentials both of its players log in with.
-    pub fn open_room(&mut self) -> Credentials {
+    pub fn open_room(&mut self, now: Instant) -> Result<Credentials, RoomRefusal> {
+        // The rate first, so that a caller refused for a full relay cannot have it swept at will.
+        if !self.opened.take(1.0, self.limits.rooms_opened, now) {
+            return Err(RoomRefusal::TooSoon);
+        }
+        if self.rooms.len() >= self.limits.rooms {
+            self.sweep(now);
+            if self.rooms.len() >= self.limits.rooms {
+                return Err(RoomRefusal::Full);
+            }
+        }
         let credentials = Credentials {
             username: random_text(),
             password: random_text(),
@@ -212,9 +245,11 @@ impl Relay {
             key,
             allocations: 0,
             bandwidth: Bucket::full(self.limits.room_bandwidth, self.epoch),
+            ends: now + self.limits.room_lifetime,
+            idle_since: now,
         };
         self.rooms.insert(credentials.username.clone(), room);
-        credentials
+        Ok(credentials)
     }
 
     /// The response to a TURN request, and the key to sign it with if it logged in.
@@ -238,20 +273,35 @@ impl Relay {
     }
 
     /// Forgets the allocation of a client whose TCP connection has closed.
-    pub fn disconnect(&mut self, client: Client) {
-        self.remove(client);
+    pub fn disconnect(&mut self, client: Client, now: Instant) {
+        self.remove(client, now);
     }
 
-    /// Forgets allocations that have expired.
+    /// Forgets allocations that have expired, and rooms that have closed with theirs.
     pub fn sweep(&mut self, now: Instant) {
+        self.sweep_allocations(now);
+        let idle = self.limits.room_idle;
+        self.rooms.retain(|_, room| room.is_open(now, idle));
+    }
+
+    /// Forgets allocations that have expired or whose room has closed, leaving the rooms be.
+    fn sweep_allocations(&mut self, now: Instant) {
+        let idle = self.limits.room_idle;
+        let rooms = &self.rooms;
+        let ended = |allocation: &Allocation| {
+            allocation.expires <= now
+                || rooms
+                    .get(&allocation.room)
+                    .is_none_or(|room| !room.is_open(now, idle))
+        };
         let expired: Vec<Client> = self
             .allocations
             .iter()
-            .filter(|(_, allocation)| allocation.expires <= now)
+            .filter(|(_, allocation)| ended(allocation))
             .map(|(client, _)| *client)
             .collect();
         for client in expired {
-            self.remove(client);
+            self.remove(client, now);
         }
     }
 
@@ -281,9 +331,9 @@ impl Relay {
             return Err(error(request, 400, "Bad Request"));
         };
         let room = std::str::from_utf8(username).ok().filter(|username| {
-            self.rooms
-                .get(*username)
-                .is_some_and(|room| request.integrity_holds(&room.key))
+            self.rooms.get(*username).is_some_and(|room| {
+                room.is_open(now, self.limits.room_idle) && request.integrity_holds(&room.key)
+            })
         });
         let Some(room) = room else {
             return Err(challenge(401, "Unauthenticated"));
@@ -334,15 +384,17 @@ impl Relay {
             Some(_) => return error(request, 400, "Bad Request"),
         }
         // An expired allocation not yet swept must not hold a place in the room.
-        self.sweep(now);
+        self.sweep_allocations(now);
         let from_address = self
             .allocations
             .keys()
             .filter(|other| other.address.ip() == client.address.ip())
             .count();
-        if self.rooms[room].allocations >= ROOM_SIZE
-            || from_address >= self.limits.allocations_per_address
-        {
+        let in_room = self
+            .rooms
+            .get(room)
+            .map_or(ROOM_SIZE, |room| room.allocations);
+        if in_room >= ROOM_SIZE || from_address >= self.limits.allocations_per_address {
             return error(request, 486, "Allocation Quota Reached");
         }
         if self.allocations.len() >= self.limits.allocations {
@@ -362,7 +414,9 @@ impl Relay {
         };
         self.allocations.insert(client, allocation);
         self.ports.insert(port, client);
-        self.rooms.get_mut(room).unwrap().allocations += 1;
+        if let Some(room) = self.rooms.get_mut(room) {
+            room.allocations += 1;
+        }
         self.allocated(request, client, now)
     }
 
@@ -391,7 +445,7 @@ impl Relay {
         }
         let lifetime = desired_lifetime(request);
         if lifetime == 0 {
-            self.remove(client);
+            self.remove(client, now);
         } else {
             allocation.expires = now + Duration::from_secs(lifetime.into());
         }
@@ -511,7 +565,10 @@ impl Relay {
         let from = SocketAddr::new(public_ip, sender.port);
         let channel = receiver.channel_to(from, now);
         let cost = (bytes + MESSAGE_COST) as f64;
-        let room = self.rooms.get_mut(&sender.room)?;
+        let room = self
+            .rooms
+            .get_mut(&sender.room)
+            .filter(|room| room.is_open(now, self.limits.room_idle))?;
         room.bandwidth
             .take(cost, self.limits.room_bandwidth, now)
             .then_some(Forward { to, from, channel })
@@ -540,16 +597,19 @@ impl Relay {
             .get(&client)
             .is_some_and(|allocation| allocation.expires <= now)
         {
-            self.remove(client);
+            self.remove(client, now);
         }
         self.allocations.get_mut(&client)
     }
 
-    fn remove(&mut self, client: Client) {
+    fn remove(&mut self, client: Client, now: Instant) {
         if let Some(allocation) = self.allocations.remove(&client) {
             self.ports.remove(&allocation.port);
             if let Some(room) = self.rooms.get_mut(&allocation.room) {
                 room.allocations -= 1;
+                if room.allocations == 0 {
+                    room.idle_since = now;
+                }
             }
         }
     }
@@ -767,7 +827,7 @@ mod tests {
     fn setup_with(limits: Limits) -> Setup {
         let start = Instant::now();
         let mut relay = Relay::new(PUBLIC_IP.into(), limits, start);
-        let room = relay.open_room();
+        let room = relay.open_room(start).unwrap();
         Setup {
             relay: Mutex::new(relay),
             room,
@@ -817,6 +877,11 @@ mod tests {
     impl Setup {
         fn relay(&mut self) -> &mut Relay {
             self.relay.get_mut().unwrap()
+        }
+
+        fn open_room(&mut self) -> Credentials {
+            let start = self.start;
+            self.relay().open_room(start).unwrap()
         }
 
         fn ask(&mut self, request: Vec<u8>, client: Client, now: Instant) -> Reply {
@@ -1055,7 +1120,11 @@ mod tests {
 
     #[test]
     fn a_nonce_lasts_an_hour_for_its_own_client_only() {
-        let mut s = setup();
+        // A room left unused for longer than the nonce, so that only the nonce can expire.
+        let mut s = setup_with(Limits {
+            room_idle: Duration::from_secs(2 * NONCE_LIFETIME),
+            ..Limits::default()
+        });
         let room = s.room.clone();
         let nonce = s.nonce(client(1), s.start);
 
@@ -1150,7 +1219,7 @@ mod tests {
         assert_eq!(s.ask(another, client(1), at(s.start, 20)).code(), Some(437));
 
         // The same transaction logged in to another room is not a retransmission.
-        let other_room = s.relay().open_room();
+        let other_room = s.open_room();
         let from_other_room = signed(ALLOCATE, &other_room, &nonce, *b"allocate-it!", udp);
         assert_eq!(
             s.ask(from_other_room, client(1), at(s.start, 30)).code(),
@@ -1169,7 +1238,7 @@ mod tests {
         assert_eq!(s.allocate(client(100), s.start).code(), Some(486));
 
         // Another room is not affected.
-        s.room = s.relay().open_room();
+        s.room = s.open_room();
         let reply = s.allocate(client(100), s.start);
         assert_eq!(reply.message().class(), Class::Success);
     }
@@ -1260,7 +1329,7 @@ mod tests {
     fn a_refresh_from_another_room_is_refused() {
         let mut s = setup();
         s.allocate(client(1), s.start);
-        s.room = s.relay().open_room();
+        s.room = s.open_room();
         assert_eq!(s.refresh(client(1), s.start, None).code(), Some(441));
     }
 
@@ -1276,7 +1345,8 @@ mod tests {
             Class::Success
         );
 
-        s.relay().disconnect(client(2));
+        let start = s.start;
+        s.relay().disconnect(client(2), start);
         assert_eq!(
             s.allocate(client(4), s.start).message().class(),
             Class::Success
@@ -1367,7 +1437,7 @@ mod tests {
         });
         assert_eq!(s.ask(malformed, client(1), s.start).code(), Some(400));
 
-        s.room = s.relay().open_room();
+        s.room = s.open_room();
         assert_eq!(s.permit(client(1), s.start, &[peer]).code(), Some(441));
     }
 
@@ -1421,7 +1491,7 @@ mod tests {
 
         // A player of another room, permitting everyone.
         let ours = s.room.clone();
-        s.room = s.relay().open_room();
+        s.room = s.open_room();
         let stranger = s.allocate(client(9), s.start).relayed();
         s.permit(client(9), s.start, &[first_relayed]);
         s.room = ours;
@@ -1556,7 +1626,7 @@ mod tests {
         let bound = s.bind(client(1), s.start, 0x4000, peer);
         assert_eq!(bound.message().class(), Class::Success);
         assert!(bound.signed_with(&s.room));
-        s.room = s.relay().open_room();
+        s.room = s.open_room();
         assert_eq!(s.bind(client(1), s.start, 0x4000, peer).code(), Some(441));
     }
 
@@ -1649,7 +1719,7 @@ mod tests {
         s.bind(first, s.start, 0x4002, first_relayed);
 
         let ours = s.room.clone();
-        s.room = s.relay().open_room();
+        s.room = s.open_room();
         let stranger = s.allocate(client(9), s.start).relayed();
         s.permit(client(9), s.start, &[first_relayed]);
         s.room = ours;
@@ -1909,5 +1979,124 @@ mod tests {
             !data.forgeable,
             "relayed data goes to an allocation's own address"
         );
+    }
+
+    #[test]
+    fn a_room_ends_after_its_lifetime_with_its_allocations() {
+        // Shorter than an allocation's and a permission's lifetimes, so only the room can end.
+        let mut s = setup_with(Limits {
+            room_lifetime: Duration::from_secs(250),
+            ..Limits::default()
+        });
+        let [(first, _), (_, second_relayed)] = two_players(&mut s);
+        assert!(s.send(first, at(s.start, 249), second_relayed).is_some());
+
+        let ended = at(s.start, 250);
+        assert_eq!(
+            s.refresh(first, ended, None).code(),
+            Some(401),
+            "its login ends with it"
+        );
+        assert!(s.send(first, ended, second_relayed).is_none());
+        s.relay().sweep(ended);
+        let relay = s.relay();
+        assert!(relay.rooms.is_empty() && relay.allocations.is_empty() && relay.ports.is_empty());
+    }
+
+    #[test]
+    fn rooms_are_opened_at_a_limited_rate() {
+        let start = Instant::now();
+        let mut relay = Relay::new(
+            PUBLIC_IP.into(),
+            Limits {
+                rooms_opened: crate::limit::Rate {
+                    per_second: 1.0,
+                    burst: 3.0,
+                },
+                ..Limits::default()
+            },
+            start,
+        );
+        for _ in 0..3 {
+            assert!(relay.open_room(start).is_ok());
+        }
+        assert_eq!(relay.open_room(start).unwrap_err(), RoomRefusal::TooSoon);
+        assert!(relay.open_room(at(start, 1)).is_ok());
+    }
+
+    #[test]
+    fn a_bounded_number_of_rooms_is_open_at_once() {
+        let start = Instant::now();
+        let mut relay = Relay::new(
+            PUBLIC_IP.into(),
+            Limits {
+                rooms: 2,
+                room_lifetime: Duration::from_secs(100),
+                ..Limits::default()
+            },
+            start,
+        );
+        assert!(relay.open_room(start).is_ok());
+        assert!(relay.open_room(start).is_ok());
+        assert_eq!(relay.open_room(start).unwrap_err(), RoomRefusal::Full);
+        assert!(
+            relay.open_room(at(start, 100)).is_ok(),
+            "an ended room gives its place back"
+        );
+    }
+
+    #[test]
+    fn a_room_nobody_allocates_in_closes_after_its_idle_time() {
+        let mut s = setup();
+        let idle = Limits::default().room_idle.as_secs();
+        let reply = s.allocate(client(1), at(s.start, idle - 1));
+        assert_eq!(reply.message().class(), Class::Success, "open until then");
+
+        s.room = s.open_room();
+        assert_eq!(s.allocate(client(2), at(s.start, idle)).code(), Some(401));
+        let start = s.start;
+        s.relay().sweep(at(start, idle));
+        assert_eq!(s.relay().rooms.len(), 1, "only the room in use is left");
+    }
+
+    #[test]
+    fn a_room_in_use_stays_open_and_closes_its_idle_time_after_its_last_allocation() {
+        let mut s = setup();
+        let idle = Limits::default().room_idle.as_secs();
+        s.allocate(client(1), s.start);
+        let mut seconds = 0;
+        while seconds < 2 * idle {
+            seconds += 500;
+            let kept = s.refresh(client(1), at(s.start, seconds), None);
+            assert_eq!(kept.message().class(), Class::Success, "at {seconds} s");
+        }
+        s.refresh(client(1), at(s.start, seconds), Some(0));
+        let (username, start) = (s.room.username.clone(), s.start);
+        let room = &s.relay().rooms[&username];
+        assert!(room.is_open(at(start, seconds + idle - 1), Duration::from_secs(idle)));
+        assert_eq!(
+            s.allocate(client(2), at(s.start, seconds + idle)).code(),
+            Some(401)
+        );
+    }
+
+    #[test]
+    fn opening_too_fast_is_refused_before_a_full_relay_is_swept() {
+        let start = Instant::now();
+        let mut relay = Relay::new(
+            PUBLIC_IP.into(),
+            Limits {
+                rooms: 1,
+                rooms_opened: crate::limit::Rate {
+                    per_second: 0.0,
+                    burst: 2.0,
+                },
+                ..Limits::default()
+            },
+            start,
+        );
+        assert!(relay.open_room(start).is_ok());
+        assert_eq!(relay.open_room(start).unwrap_err(), RoomRefusal::Full);
+        assert_eq!(relay.open_room(start).unwrap_err(), RoomRefusal::TooSoon);
     }
 }

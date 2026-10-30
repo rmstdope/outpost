@@ -2,6 +2,7 @@
 //! room. PLAN.md describes where it is going; so far it is a STUN server that also hands out
 //! TURN allocations.
 
+mod api;
 mod limit;
 mod relay;
 pub mod stun;
@@ -25,6 +26,8 @@ pub struct Config {
     pub revision: String,
     /// Where the HTTP side listens.
     pub web: SocketAddr,
+    /// Where the internal API listens (`POST /rooms`). Never published.
+    pub internal: SocketAddr,
     /// Where the TURN port listens, on both UDP and TCP.
     pub turn: SocketAddr,
     /// How long `/healthz` waits for the TURN port to answer.
@@ -40,6 +43,7 @@ impl Default for Config {
         Config {
             revision: "unknown".to_string(),
             web: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080)),
+            internal: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8081)),
             turn: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 3478)),
             probe_timeout: Duration::from_secs(1),
             public_ip: Ipv4Addr::LOCALHOST,
@@ -49,17 +53,19 @@ impl Default for Config {
 }
 
 impl Config {
-    /// The defaults, with `OUTPOST_REVISION` and `OUTPOST_PUBLIC_IP` applied.
+    /// The defaults, with `OUTPOST_REVISION` and `OUTPOST_PUBLIC_IP` applied. The public IP
+    /// must be given: players are handed it, and a wrong one fails only in their browsers.
     pub fn from_env() -> Result<Self, String> {
         let mut config = Config::default();
         if let Ok(revision) = std::env::var("OUTPOST_REVISION") {
             config.revision = revision;
         }
-        if let Ok(ip) = std::env::var("OUTPOST_PUBLIC_IP") {
-            config.public_ip = ip
-                .parse()
-                .map_err(|_| format!("OUTPOST_PUBLIC_IP is not an IPv4 address: {ip}"))?;
-        }
+        let ip = std::env::var("OUTPOST_PUBLIC_IP").map_err(|_| {
+            "OUTPOST_PUBLIC_IP must be set to the IPv4 address players reach outpost at".to_string()
+        })?;
+        config.public_ip = ip
+            .parse()
+            .map_err(|_| format!("OUTPOST_PUBLIC_IP is not an IPv4 address: {ip}"))?;
         Ok(config)
     }
 }
@@ -69,6 +75,7 @@ pub struct Outpost {
     revision: String,
     probe_timeout: Duration,
     web: TcpListener,
+    internal: TcpListener,
     tcp: TcpListener,
     network: turn::Shared,
     public_ip: Ipv4Addr,
@@ -79,6 +86,7 @@ impl Outpost {
         let relay = relay::Relay::new(config.public_ip, config.limits, Instant::now());
         Ok(Outpost {
             web: TcpListener::bind(config.web).await?,
+            internal: TcpListener::bind(config.internal).await?,
             network: turn::Network::new(relay, UdpSocket::bind(config.turn).await?, config.limits),
             tcp: TcpListener::bind(config.turn).await?,
             revision: config.revision,
@@ -93,8 +101,20 @@ impl Outpost {
     }
 
     /// Opens a room and returns the credentials both of its players log in with.
-    pub fn open_room(&self) -> Credentials {
-        self.network.relay.lock().unwrap().open_room()
+    /// As `POST /rooms` on the internal API does, if the limits allow another room.
+    pub fn open_room(&self) -> Option<Credentials> {
+        self.network
+            .relay
+            .lock()
+            .unwrap()
+            .open_room(Instant::now())
+            .ok()
+    }
+
+    pub fn internal_addr(&self) -> SocketAddr {
+        self.internal
+            .local_addr()
+            .expect("a bound listener has an address")
     }
 
     pub fn web_addr(&self) -> SocketAddr {
@@ -120,8 +140,15 @@ impl Outpost {
     /// over to another process anyway.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> io::Result<()> {
         let app = app(self.revision.clone(), self.probe(), self.probe_timeout);
+        let api = api::app(
+            self.network.clone(),
+            self.public_ip,
+            self.udp_addr(),
+            self.tcp_addr(),
+        );
         tokio::select! {
             result = axum::serve(self.web, app).into_future() => result,
+            result = axum::serve(self.internal, api).into_future() => result,
             result = turn::serve_udp(self.network.clone()) => result,
             result = turn::serve_tcp(self.tcp, self.network.clone()) => result,
             result = turn::sweep(self.network) => result,

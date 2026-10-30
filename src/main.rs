@@ -10,8 +10,9 @@ async fn main() -> std::io::Result<()> {
     let config = Config::from_env().map_err(std::io::Error::other)?;
     let outpost = Outpost::bind(config).await?;
     tracing::info!(
-        "listening: HTTP on {}, TURN on {} (UDP) and {} (TCP), relaying on {}",
+        "listening: HTTP on {} and {} (internal), TURN on {} (UDP) and {} (TCP), relaying on {}",
         outpost.web_addr(),
+        outpost.internal_addr(),
         outpost.udp_addr(),
         outpost.tcp_addr(),
         outpost.public_ip()
