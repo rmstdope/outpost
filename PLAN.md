@@ -92,6 +92,9 @@ channel through it. Also run it once on the VPS behind Docker's UDP port publish
 **Gate:** if Chrome won't use relay↔relay forwarding inside one process, stop and revisit D1.
 The fallback is a general relay with a deny-list and a port range.
 
+**Done (2026-10-30): passed** in Chrome and Firefox, locally and on the VPS behind Docker's
+published UDP port, which keeps the players' real addresses. Details are in `spike/README.md`.
+
 ### 2. outpost skeleton and CI (outpost)
 
 Same shape as liaison:
