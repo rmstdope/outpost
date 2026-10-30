@@ -299,6 +299,26 @@ needs no change there.
    - a STUN Binding to `outpost.rmstdope.eu:3478` returns your public address;
    - the step-1 Playwright test pointed at production.
 
+**Done (2026-10-30).**
+- **UFW:** rules for `3478/udp` and `3478/tcp` added for IPv4 and IPv6, commented "outpost TURN".
+- **Tooling and validation:** infra tooling installed at 66ec752, and `validate outpost` passed.
+- **First release:** run 20261030T110328-b68e35e9, revision f2772e2 and image digest
+  `sha256:1fed2c2e…`. It is not enrolled in automatic updates.
+- **Checked from outside:**
+  - `https://outpost.rmstdope.eu/release.json` names f2772e2, and `/healthz` is `ok`;
+  - `POST /rooms` through Caddy is 404, and 8081 cannot be reached from the internet;
+  - a STUN Binding over UDP and TCP to 136.148.215.87:3478 answers with the client's real
+    public address;
+  - `browser/relay.mjs`, with rooms opened through an SSH tunnel to the container's 8081,
+    passed all eight cases: Chrome and Firefox, UDP and TCP, both scenarios.
+- **Other apps:** healthy and unchanged by the release.
+- **CI fix on the way:** main CI had failed because `docker stop` took 6.6 s. outpost exits
+  0.07 s after SIGTERM, and the time went to Docker removing the published ports. CI now
+  checks that outpost exits within 5 s of SIGTERM (exit code 0, not 137) instead of timing
+  Docker (#11).
+- **IPv6:** Docker also listens on `[::]:3478`, since the VPS has an IPv6 stack, though DNS
+  has no AAAA record. outpost hands out only its IPv4 address.
+
 ### 8. liaison hands out relay credentials (liaison)
 
 On `create`, liaison asks outpost for a room (`POST http://outpost-web:8081/rooms`), keeps the
