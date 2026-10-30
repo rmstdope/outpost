@@ -122,6 +122,23 @@ gathered through a local outpost as their STUN server.
 
 ### 4. TURN relay (outpost)
 
+Delivered in four pull requests:
+- **4a.** Allocate and Refresh with long-term authentication, rooms of two allocations, and
+  lifetimes.
+- **4b.** CreatePermission, and Send and Data indications, within a room only.
+- **4c.** ChannelBind and ChannelData, over UDP and TCP.
+- **4d.** The limits below, and the Playwright test run in CI against the container.
+
+**4a done (2026-10-30).** Chrome and Firefox allocate over UDP and TCP; a wrong password draws a
+401. Decisions on the way:
+- A room is one username and password, as D2 has it, so the quota of two allocations per room
+  is the per-username quota RFC 8656 §7.2 recommends.
+- Nonces are stateless: an issue time plus an HMAC over the client's address and transport,
+  under a per-process secret. RFC 8489 forbids giving two source addresses the same nonce.
+- Nonces carry no RFC 8489 "nonce cookie", so clients use plain MD5 keys and MESSAGE-INTEGRITY,
+  as browsers do.
+- Rooms do not expire yet; step 5 gives them their 12 hours.
+
 - Allocations with long-term credential authentication (realm, nonce).
 - Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData.
 - The same requests over TCP 3478, with RFC 8656's framing (D3).
@@ -162,7 +179,8 @@ routed by Caddy.
 - **`apps/outpost/`:**
   - `app.json`: static profile, workflow source `rmstdope/outpost`, used for
     `release --latest` but not enrolled;
-  - `compose.json`: `ports: ["3478:3478/udp", "3478:3478/tcp"]` and proxy alias `outpost-web`,
+  - `compose.json`: `ports: ["3478:3478/udp", "3478:3478/tcp"]`, `OUTPOST_PUBLIC_IP` set to
+    the VPS's address, and proxy alias `outpost-web`,
     hardened like
     `control` (`user 10001`, `read_only`, `cap_drop: ALL`, `no-new-privileges`), plus
     `mem_limit`, healthcheck and logging;

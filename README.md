@@ -5,15 +5,25 @@ TURN relay for NESER network play. When two players' networks cannot be connecte
 through outpost instead. outpost relays only between the two players of one room, never to any
 other address. How it gets there is in [PLAN.md](PLAN.md).
 
-So far outpost is a STUN server (RFC 8489): it answers Binding requests with the address they
-came from, which tells a browser its public address. The relay itself comes in PLAN.md step 4.
+So far outpost is a STUN server (RFC 8489) that also hands out TURN allocations (RFC 8656):
+- a Binding request is answered with the address it came from, which tells a browser its public
+  address;
+- Allocate and Refresh need a room's credentials (the long-term credential mechanism, realm
+  `outpost`). A room is one username and password, shared by its two players, and holds at
+  most one allocation for each. Relaying data between them comes in PLAN.md step 4b.
 
 How it answers, over UDP and TCP alike:
 - every response ends in a FINGERPRINT and names `outpost` as its SOFTWARE;
 - a request whose FINGERPRINT fails is dropped, as is anything that is not a request, or a
   request for a method outpost does not serve;
 - a request carrying a comprehension-required attribute outpost does not know gets a 420 (Unknown
-  Attribute) naming it.
+  Attribute) naming it;
+- a TURN request without a valid login is challenged with a 401 carrying the realm and a nonce.
+  The nonce is tied to the client's address and transport and lasts an hour, then draws a 438;
+- an allocation is UDP over IPv4 only. It lasts 10 minutes unless the client asks for longer
+  (at most an hour), and it ends with a Refresh of lifetime 0, or when its TCP connection
+  closes. Relayed ports are picked at random from 49152–65535. Nothing listens on them,
+  because an allocation is reached only through outpost.
 
 ## Running
 
@@ -25,6 +35,7 @@ cargo test                     # unit and end-to-end tests
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `OUTPOST_REVISION` | `unknown` | Source commit served from `/release.json`; the image sets it at build time. |
+| `OUTPOST_PUBLIC_IP` | `127.0.0.1` | The address players reach port 3478 at. Relayed addresses are given on it, so production must set it. |
 
 ## Ports
 

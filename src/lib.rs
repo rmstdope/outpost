@@ -1,17 +1,21 @@
 //! outpost: a TURN relay for NESER network play that relays only between the two players of a
-//! room. PLAN.md describes where it is going; so far it answers STUN Binding requests.
+//! room. PLAN.md describes where it is going; so far it is a STUN server that also hands out
+//! TURN allocations.
 
+mod relay;
 pub mod stun;
 mod turn;
 mod web;
 
 use std::future::{Future, IntoFuture};
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, UdpSocket};
 
+pub use relay::Credentials;
 pub use web::app;
 
 #[derive(Clone, Debug)]
@@ -24,6 +28,9 @@ pub struct Config {
     pub turn: SocketAddr,
     /// How long `/healthz` waits for the TURN port to answer.
     pub probe_timeout: Duration,
+    /// The address players reach the TURN port at, given as the address of their relayed
+    /// connections.
+    pub public_ip: IpAddr,
 }
 
 impl Default for Config {
@@ -33,18 +40,24 @@ impl Default for Config {
             web: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080)),
             turn: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 3478)),
             probe_timeout: Duration::from_secs(1),
+            public_ip: Ipv4Addr::LOCALHOST.into(),
         }
     }
 }
 
 impl Config {
-    /// The defaults, with `OUTPOST_REVISION` applied.
-    pub fn from_env() -> Self {
+    /// The defaults, with `OUTPOST_REVISION` and `OUTPOST_PUBLIC_IP` applied.
+    pub fn from_env() -> Result<Self, String> {
         let mut config = Config::default();
         if let Ok(revision) = std::env::var("OUTPOST_REVISION") {
             config.revision = revision;
         }
-        config
+        if let Ok(ip) = std::env::var("OUTPOST_PUBLIC_IP") {
+            config.public_ip = ip
+                .parse()
+                .map_err(|_| format!("OUTPOST_PUBLIC_IP is not an IP address: {ip}"))?;
+        }
+        Ok(config)
     }
 }
 
@@ -55,6 +68,7 @@ pub struct Outpost {
     web: TcpListener,
     udp: UdpSocket,
     tcp: TcpListener,
+    relay: turn::Shared,
 }
 
 impl Outpost {
@@ -65,7 +79,16 @@ impl Outpost {
             tcp: TcpListener::bind(config.turn).await?,
             revision: config.revision,
             probe_timeout: config.probe_timeout,
+            relay: Arc::new(Mutex::new(relay::Relay::new(
+                config.public_ip,
+                Instant::now(),
+            ))),
         })
+    }
+
+    /// Opens a room and returns the credentials both of its players log in with.
+    pub fn open_room(&self) -> Credentials {
+        self.relay.lock().unwrap().open_room()
     }
 
     pub fn web_addr(&self) -> SocketAddr {
@@ -92,8 +115,9 @@ impl Outpost {
         let app = app(self.revision.clone(), self.probe(), self.probe_timeout);
         tokio::select! {
             result = axum::serve(self.web, app).into_future() => result,
-            result = turn::serve_udp(self.udp) => result,
-            result = turn::serve_tcp(self.tcp) => result,
+            result = turn::serve_udp(self.udp, self.relay.clone()) => result,
+            result = turn::serve_tcp(self.tcp, self.relay.clone()) => result,
+            result = turn::sweep(self.relay) => result,
             () = shutdown => Ok(()),
         }
     }
