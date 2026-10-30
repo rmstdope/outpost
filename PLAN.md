@@ -329,6 +329,15 @@ liaison updates the protocol in the README and keeps automatic updates.
 If outpost doesn't answer within a second, liaison leaves the relay out and the room still
 works; direct connections are unaffected. Tests use a fake outpost.
 
+**Done (2026-10-30)** in liaison PR #3, which auto-deployed as 963e420 within minutes.
+- `created` and `joined` carry the same `iceServers` entry from one outpost room per game.
+- A full liaison asks outpost for nothing.
+- Each client address gets 3 relays at once and one more every 10 s; beyond that its rooms
+  open without one. The review found that otherwise one client could keep outpost at 429, and
+  honest games would lose their relay.
+- In production, two Chrome pages and two Firefox pages on `neser.rmstdope.eu` met through
+  liaison, took its relay, and opened a data channel relay↔relay through outpost.
+
 ### 9. NESER uses the relay (bead, after nr-z4nw and nr-ri8n)
 
 Network play passes liaison's `iceServers` to the connection. Players see this change, so it
