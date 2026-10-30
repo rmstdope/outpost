@@ -3,8 +3,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use outpost::stun::{self, BINDING, Builder, Class, Message};
-use outpost::{Config, Outpost};
+use outpost::stun::attribute::{
+    ERROR_CODE, NONCE, REALM, REQUESTED_TRANSPORT, USERNAME, XOR_RELAYED_ADDRESS,
+};
+use outpost::stun::{self, ALLOCATE, BINDING, Builder, Class, Message, long_term_key};
+use outpost::{Config, Credentials, Outpost};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -14,6 +17,7 @@ struct Running {
     web: SocketAddr,
     udp: SocketAddr,
     tcp: SocketAddr,
+    room: Credentials,
 }
 
 async fn start(revision: &str) -> Running {
@@ -30,6 +34,7 @@ async fn start(revision: &str) -> Running {
         web: outpost.web_addr(),
         udp: outpost.udp_addr(),
         tcp: outpost.tcp_addr(),
+        room: outpost.open_room(),
     };
     tokio::spawn(outpost.run(std::future::pending()));
     running
@@ -174,4 +179,117 @@ async fn the_front_page_says_what_outpost_is() {
     assert!(head.contains("content-type: text/html"), "{head}");
     assert!(body.contains("relay for NESER network play"), "{body}");
     assert!(body.contains("https://neser.rmstdope.eu"), "{body}");
+}
+
+/// A TURN client's connection to outpost, over either transport.
+enum Line {
+    Udp(UdpSocket, SocketAddr),
+    Tcp(TcpStream),
+}
+
+impl Line {
+    async fn udp(server: SocketAddr) -> Line {
+        Line::Udp(UdpSocket::bind("127.0.0.1:0").await.unwrap(), server)
+    }
+
+    async fn tcp(server: SocketAddr) -> Line {
+        Line::Tcp(TcpStream::connect(server).await.unwrap())
+    }
+
+    async fn ask(&mut self, request: &[u8]) -> Vec<u8> {
+        match self {
+            Line::Udp(socket, server) => {
+                socket.send_to(request, *server).await.unwrap();
+                let mut datagram = vec![0; 2048];
+                let size = within(socket.recv(&mut datagram)).await.unwrap();
+                datagram.truncate(size);
+                datagram
+            }
+            Line::Tcp(stream) => {
+                stream.write_all(request).await.unwrap();
+                let mut reply = vec![0; stun::HEADER_LEN];
+                within(stream.read_exact(&mut reply)).await.unwrap();
+                reply.resize(stun::message_length(&reply).unwrap(), 0);
+                within(stream.read_exact(&mut reply[stun::HEADER_LEN..]))
+                    .await
+                    .unwrap();
+                reply
+            }
+        }
+    }
+
+    /// Allocates as a browser does: unsigned first, then signed with the nonce it was given.
+    /// Answers the final reply.
+    async fn allocate(&mut self, room: &Credentials) -> Vec<u8> {
+        let request = |transaction| {
+            Builder::new(ALLOCATE, Class::Request, transaction)
+                .attribute(REQUESTED_TRANSPORT, &[17, 0, 0, 0])
+        };
+        let challenge = self.ask(&request(*b"first-try!!!").build()).await;
+        let challenge = Message::parse(&challenge).unwrap();
+        assert_eq!(error_code(&challenge), Some(401));
+        let key = long_term_key(&room.username, "outpost", &room.password);
+        let signed = request(*b"second-try!!")
+            .attribute(USERNAME, room.username.as_bytes())
+            .attribute(REALM, challenge.attribute(REALM).unwrap())
+            .attribute(NONCE, challenge.attribute(NONCE).unwrap())
+            .integrity(&key)
+            .fingerprint();
+        self.ask(&signed).await
+    }
+}
+
+fn error_code(message: &Message) -> Option<u16> {
+    let value = message.attribute(ERROR_CODE)?;
+    Some(u16::from(value[2]) * 100 + u16::from(value[3]))
+}
+
+#[tokio::test]
+async fn both_players_of_a_room_get_relayed_addresses_over_udp_and_tcp() {
+    let outpost = start("test").await;
+    let key = long_term_key(&outpost.room.username, "outpost", &outpost.room.password);
+    let mut relayed = vec![];
+    for mut line in [Line::udp(outpost.udp).await, Line::tcp(outpost.tcp).await] {
+        let reply = line.allocate(&outpost.room).await;
+        let reply = Message::parse(&reply).unwrap();
+        assert_eq!(reply.class(), Class::Success);
+        assert!(reply.integrity_holds(&key));
+        relayed.push(reply.xor_address(XOR_RELAYED_ADDRESS).unwrap());
+    }
+    assert_ne!(relayed[0], relayed[1]);
+    assert!(relayed.iter().all(|address| address.ip().is_loopback()));
+}
+
+#[tokio::test]
+async fn a_closed_tcp_connection_gives_its_place_in_the_room_back() {
+    let outpost = start("test").await;
+    let mut over_tcp = Line::tcp(outpost.tcp).await;
+    let reply = over_tcp.allocate(&outpost.room).await;
+    assert_eq!(Message::parse(&reply).unwrap().class(), Class::Success);
+    // Fill the rest of the room over UDP.
+    let mut lines = vec![];
+    loop {
+        let mut line = Line::udp(outpost.udp).await;
+        let reply = line.allocate(&outpost.room).await;
+        match error_code(&Message::parse(&reply).unwrap()) {
+            None => lines.push(line),
+            Some(code) => {
+                assert_eq!(code, 486);
+                break;
+            }
+        }
+    }
+
+    drop(over_tcp);
+    within(async {
+        loop {
+            let mut line = Line::udp(outpost.udp).await;
+            let reply = line.allocate(&outpost.room).await;
+            if Message::parse(&reply).unwrap().class() == Class::Success {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
 }

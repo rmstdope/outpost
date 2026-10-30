@@ -11,17 +11,35 @@ pub const MAGIC_COOKIE: u32 = 0x2112_A442;
 pub const HEADER_LEN: usize = 20;
 
 pub const BINDING: u16 = 0x001;
+/// TURN's methods (RFC 8656 §18).
+pub const ALLOCATE: u16 = 0x003;
+pub const REFRESH: u16 = 0x004;
+pub const SEND: u16 = 0x006;
+pub const DATA: u16 = 0x007;
+pub const CREATE_PERMISSION: u16 = 0x008;
+pub const CHANNEL_BIND: u16 = 0x009;
 
-/// Attribute types (RFC 8489 §18.3). Those below 0x8000 are comprehension-required.
+/// Attribute types (RFC 8489 §18.3, RFC 8656 §18). Those below 0x8000 are
+/// comprehension-required.
 pub mod attribute {
     pub const USERNAME: u16 = 0x0006;
     pub const MESSAGE_INTEGRITY: u16 = 0x0008;
     pub const MESSAGE_INTEGRITY_SHA256: u16 = 0x001C;
     pub const ERROR_CODE: u16 = 0x0009;
     pub const UNKNOWN_ATTRIBUTES: u16 = 0x000A;
+    pub const CHANNEL_NUMBER: u16 = 0x000C;
+    pub const LIFETIME: u16 = 0x000D;
+    pub const XOR_PEER_ADDRESS: u16 = 0x0012;
+    pub const DATA: u16 = 0x0013;
     pub const REALM: u16 = 0x0014;
     pub const NONCE: u16 = 0x0015;
+    pub const XOR_RELAYED_ADDRESS: u16 = 0x0016;
+    pub const REQUESTED_ADDRESS_FAMILY: u16 = 0x0017;
+    pub const EVEN_PORT: u16 = 0x0018;
+    pub const REQUESTED_TRANSPORT: u16 = 0x0019;
+    pub const DONT_FRAGMENT: u16 = 0x001A;
     pub const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+    pub const RESERVATION_TOKEN: u16 = 0x0022;
     pub const SOFTWARE: u16 = 0x8022;
     pub const FINGERPRINT: u16 = 0x8028;
 }

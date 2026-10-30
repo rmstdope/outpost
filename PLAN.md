@@ -122,12 +122,33 @@ gathered through a local outpost as their STUN server.
 
 ### 4. TURN relay (outpost)
 
+Delivered in four pull requests:
+- **4a.** Allocate and Refresh with long-term authentication, a quota per room, and lifetimes.
+- **4b.** CreatePermission, and Send and Data indications, within a room only.
+- **4c.** ChannelBind and ChannelData, over UDP and TCP.
+- **4d.** The limits below, and the Playwright test run in CI against the container.
+
+**4a done (2026-10-30).** Chrome and Firefox allocate over UDP and TCP; a wrong password draws a
+401. Decisions on the way:
+- A room is one username and password, as D2 has it, so its quota is the per-username quota
+  RFC 8656 §7.2 recommends. It is **eight allocations, not two**. A browser allocates once per
+  TURN URL and network interface (UDP and TCP from D3; Wi-Fi and a VPN), and a reload leaves
+  the old allocation until it expires, so with two places one player could fill the room. The
+  room rule (D1) still keeps relaying inside the room.
+- Only TURN requests take the relay's lock. Reading, Binding, signing and fingerprinting
+  happen outside it, so a large unauthenticated message cannot stall the relay.
+- Nonces are stateless: an issue time plus an HMAC over the client's address and transport,
+  under a per-process secret. RFC 8489 forbids giving two source addresses the same nonce.
+- Nonces carry no RFC 8489 "nonce cookie", so clients use plain MD5 keys and MESSAGE-INTEGRITY,
+  as browsers do.
+- Rooms do not expire yet; step 5 gives them their 12 hours.
+
 - Allocations with long-term credential authentication (realm, nonce).
 - Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData.
 - The same requests over TCP 3478, with RFC 8656's framing (D3).
 - The room rule from D1.
 - Limits:
-  - two allocations per room;
+  - eight allocations per room (4a);
   - allocations per client address;
   - TCP connections per client address, and idle TCP connections closed;
   - answers per client address over UDP: a spoofed 20-byte Binding request draws a reply about
@@ -162,7 +183,8 @@ routed by Caddy.
 - **`apps/outpost/`:**
   - `app.json`: static profile, workflow source `rmstdope/outpost`, used for
     `release --latest` but not enrolled;
-  - `compose.json`: `ports: ["3478:3478/udp", "3478:3478/tcp"]` and proxy alias `outpost-web`,
+  - `compose.json`: `ports: ["3478:3478/udp", "3478:3478/tcp"]`, `OUTPOST_PUBLIC_IP` set to
+    the VPS's address, and proxy alias `outpost-web`,
     hardened like
     `control` (`user 10001`, `read_only`, `cap_drop: ALL`, `no-new-privileges`), plus
     `mem_limit`, healthcheck and logging;

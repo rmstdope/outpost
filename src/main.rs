@@ -7,12 +7,14 @@ async fn main() -> std::io::Result<()> {
         .with_target(false)
         .with_ansi(false)
         .init();
-    let outpost = Outpost::bind(Config::from_env()).await?;
+    let config = Config::from_env().map_err(std::io::Error::other)?;
+    let outpost = Outpost::bind(config).await?;
     tracing::info!(
-        "listening: HTTP on {}, TURN on {} (UDP) and {} (TCP)",
+        "listening: HTTP on {}, TURN on {} (UDP) and {} (TCP), relaying on {}",
         outpost.web_addr(),
         outpost.udp_addr(),
-        outpost.tcp_addr()
+        outpost.tcp_addr(),
+        outpost.public_ip()
     );
     outpost.run(terminated()).await
 }
