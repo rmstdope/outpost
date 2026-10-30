@@ -116,6 +116,10 @@ The rest of RFC 8489 that step 4 relies on:
 - error responses, including 420 for unknown comprehension-required attributes;
 - ignoring what is not addressed to a server (responses, unknown classes).
 
+**Done (2026-10-30).** RFC 8489 §6.3 settled one point: a server drops requests for methods it
+does not serve silently, rather than answering them with an error. Chrome and Firefox both
+gathered through a local outpost as their STUN server.
+
 ### 4. TURN relay (outpost)
 
 - Allocations with long-term credential authentication (realm, nonce).
@@ -126,6 +130,8 @@ The rest of RFC 8489 that step 4 relies on:
   - two allocations per room;
   - allocations per client address;
   - TCP connections per client address, and idle TCP connections closed;
+  - answers per client address over UDP: a spoofed 20-byte Binding request draws a reply about
+    three times its size, so outpost must not be a useful reflector;
   - a bandwidth cap per allocation, with room for bursts;
   - lifetimes;
   - total allocations.

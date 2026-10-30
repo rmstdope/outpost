@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use tokio::net::UdpSocket;
 
-use crate::stun::{self, Message};
+use crate::stun::{self, Class, Message};
 
 struct Shared {
     revision: String,
@@ -60,9 +60,9 @@ async fn binding_answered(target: SocketAddr) -> std::io::Result<bool> {
     loop {
         let size = socket.recv(&mut datagram).await?;
         if let Some(message) = Message::parse(&datagram[..size])
-            && message.transaction == transaction
+            && message.transaction() == transaction
         {
-            return Ok(message.is_binding_success());
+            return Ok(message.class() == Class::Success);
         }
     }
 }

@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use outpost::stun::{self, Message};
+use outpost::stun::{self, BINDING, Builder, Class, Message};
 use outpost::{Config, Outpost};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -65,8 +65,8 @@ async fn a_binding_request_over_udp_is_told_its_own_address() {
     let (size, from) = within(client.recv_from(&mut datagram)).await.unwrap();
     assert_eq!(from, outpost.udp);
     let reply = Message::parse(&datagram[..size]).unwrap();
-    assert!(reply.is_binding_success());
-    assert_eq!(reply.transaction, TRANSACTION);
+    assert_eq!(reply.class(), Class::Success);
+    assert_eq!(reply.transaction(), TRANSACTION);
     assert_eq!(reply.mapped_address(), Some(client.local_addr().unwrap()));
 }
 
@@ -76,7 +76,7 @@ async fn udp_ignores_what_is_not_a_binding_request_and_keeps_answering() {
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let not_requests = [
         b"hello".to_vec(),
-        stun::binding_success(*b"not-asked-4u", client.local_addr().unwrap()),
+        Builder::new(BINDING, Class::Success, *b"not-asked-4u").build(),
     ];
     for datagram in &not_requests {
         client.send_to(datagram, outpost.udp).await.unwrap();
@@ -88,7 +88,7 @@ async fn udp_ignores_what_is_not_a_binding_request_and_keeps_answering() {
     let mut datagram = [0; 512];
     let size = within(client.recv(&mut datagram)).await.unwrap();
     assert_eq!(
-        Message::parse(&datagram[..size]).unwrap().transaction,
+        Message::parse(&datagram[..size]).unwrap().transaction(),
         TRANSACTION,
         "the first answer is to the only request"
     );
@@ -111,8 +111,8 @@ async fn binding_requests_over_tcp_are_answered_in_order_on_one_connection() {
             .await
             .unwrap();
         let reply = Message::parse(&reply).unwrap();
-        assert!(reply.is_binding_success());
-        assert_eq!(&reply.transaction, transaction);
+        assert_eq!(reply.class(), Class::Success);
+        assert_eq!(&reply.transaction(), transaction);
         assert_eq!(reply.mapped_address(), Some(client.local_addr().unwrap()));
     }
 }
