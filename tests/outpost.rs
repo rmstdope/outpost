@@ -524,4 +524,16 @@ async fn channel_data_crosses_between_udp_and_tcp_padded_only_over_tcp() {
     );
     let binding = over_tcp.ask(&stun::binding_request(TRANSACTION)).await;
     assert_eq!(Message::parse(&binding).unwrap().transaction(), TRANSACTION);
+
+    // The smallest and the largest ChannelData a TCP connection takes.
+    let largest = vec![7; 2044];
+    for data in [&[][..], &largest] {
+        over_tcp.put(&stun::channel_data(0x4002, data, true)).await;
+        assert_eq!(
+            over_udp.next().await,
+            stun::channel_data(0x4001, data, false)
+        );
+    }
+    let binding = over_tcp.ask(&stun::binding_request(TRANSACTION)).await;
+    assert_eq!(Message::parse(&binding).unwrap().transaction(), TRANSACTION);
 }

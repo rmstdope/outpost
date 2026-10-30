@@ -290,7 +290,9 @@ impl Relay {
             ALLOCATE => self.allocate(request, client, room, now),
             REFRESH => self.refresh(request, client, room, now),
             CREATE_PERMISSION => self.create_permission(request, client, room, now),
-            _ => self.channel_bind(request, client, room, now),
+            CHANNEL_BIND => self.channel_bind(request, client, room, now),
+            // `handle` lets only the methods above through.
+            _ => error(request, 400, "Bad Request"),
         }
     }
 
@@ -553,9 +555,9 @@ impl Relay {
 }
 
 /// What one message from `client` leads to, if anything: an answer to a request, or data for
-/// the other player from a Send indication or a ChannelData message. Responses, other indications, methods outpost does
-/// not serve and messages whose FINGERPRINT fails are dropped silently (RFC 8489 §6.3). Only
-/// TURN messages take the lock, and only for the relay's own work: reading, Binding, signing and
+/// the other player from a Send indication or a ChannelData message. Responses, other
+/// indications, methods outpost does not serve and messages whose FINGERPRINT fails are dropped
+/// silently (RFC 8489 §6.3). Only TURN messages take the lock, and only for the relay's own work: reading, Binding, signing and
 /// fingerprinting happen outside it.
 pub fn handle(
     relay: &Mutex<Relay>,
@@ -1643,5 +1645,77 @@ mod tests {
         );
         let refresh = s.bind(client(1), s.start, 0x4000, peer(0));
         assert_eq!(refresh.message().class(), Class::Success);
+    }
+
+    #[test]
+    fn data_reaches_a_receiver_whose_channel_expired_as_a_data_indication() {
+        let mut s = setup();
+        let first = s.allocate(client(1), s.start).relayed();
+        let second = s.allocate(client(2), s.start).relayed();
+        s.refresh(client(1), s.start, Some(MAX_LIFETIME));
+        s.refresh(client(2), s.start, Some(MAX_LIFETIME));
+        s.bind(client(1), s.start, 0x4000, second);
+        s.bind(client(2), s.start, 0x4001, first);
+        let after = at(s.start, CHANNEL_LIFETIME.as_secs());
+        s.permit(client(1), after, &[second]);
+        s.permit(client(2), after, &[first]);
+        let outgoing = s.send(client(1), after, second).expect("relayed");
+        let data = Message::parse(&outgoing.message).expect("a Data indication, not ChannelData");
+        assert_eq!(
+            (data.method(), data.class()),
+            (stun::DATA, Class::Indication)
+        );
+    }
+
+    #[test]
+    fn channel_data_does_not_renew_the_permissions_it_relies_on() {
+        let mut s = setup();
+        let first = s.allocate(client(1), s.start).relayed();
+        let second = s.allocate(client(2), s.start).relayed();
+        s.bind(client(1), s.start, 0x4000, second);
+        s.bind(client(2), s.start, 0x4001, first);
+        let lifetime = PERMISSION_LIFETIME.as_secs();
+        for seconds in [1, lifetime / 2, lifetime - 1] {
+            assert!(
+                s.on_channel(client(1), at(s.start, seconds), 0x4000)
+                    .is_some()
+            );
+        }
+        assert!(
+            s.on_channel(client(1), at(s.start, lifetime), 0x4000)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_channel_to_a_new_peer_is_refused_when_its_permission_does_not_fit() {
+        let mut s = setup();
+        s.allocate(client(1), s.start);
+        let peers: Vec<SocketAddr> = (0..MAX_PERMISSIONS as u32)
+            .map(|n| SocketAddr::from((Ipv4Addr::from(0x0a00_0000 + n), 1)))
+            .collect();
+        s.permit(client(1), s.start, &peers);
+        let new_peer: SocketAddr = "203.0.113.50:1".parse().unwrap();
+        assert_eq!(
+            s.bind(client(1), s.start, 0x4000, new_peer).code(),
+            Some(508)
+        );
+        // Nothing was bound: the number is free for a peer that already has a permission.
+        let reply = s.bind(client(1), s.start, 0x4000, peers[0]);
+        assert_eq!(reply.message().class(), Class::Success);
+    }
+
+    #[test]
+    fn expired_channels_give_their_places_back() {
+        let mut s = setup();
+        s.allocate(client(1), s.start);
+        s.refresh(client(1), s.start, Some(MAX_LIFETIME));
+        let peer = |n: u16| SocketAddr::from(([10, 0, 0, 1], n));
+        for n in 0..MAX_CHANNELS as u16 {
+            s.bind(client(1), s.start, 0x4000 + n, peer(n));
+        }
+        let later = at(s.start, CHANNEL_LIFETIME.as_secs());
+        let reply = s.bind(client(1), later, 0x4fff, peer(999));
+        assert_eq!(reply.message().class(), Class::Success);
     }
 }
