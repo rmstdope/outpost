@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 use crate::relay::{self, Client, Outgoing, Relay, Transport};
-use crate::stun::{self, HEADER_LEN};
+use crate::stun::{self, CHANNEL_DATA_HEADER_LEN, HEADER_LEN};
 
 /// The longest message outpost takes, over either transport: more than any browser sends, and
 /// it keeps what a TCP client's queue can hold small.
@@ -149,19 +149,29 @@ async fn connection(stream: TcpStream, from: SocketAddr, network: Shared) {
     }
 }
 
-/// Over TCP, STUN messages follow each other with no other framing (RFC 8489 §6.2.2). Anything
-/// that is not a STUN message, or is longer than `MAX_MESSAGE`, ends the connection.
+/// Over TCP, STUN and ChannelData messages follow each other with no other framing; the first
+/// four bytes tell which comes next and how long it is (RFC 8489 §6.2.2, RFC 8656 §12.5).
+/// Anything else, or a message longer than `MAX_MESSAGE`, ends the connection.
 async fn messages(reader: &mut OwnedReadHalf, client: Client, network: &Network) -> io::Result<()> {
-    let mut message = vec![0; HEADER_LEN];
+    let mut message = Vec::with_capacity(MAX_MESSAGE);
     loop {
-        message.resize(HEADER_LEN, 0);
+        message.resize(CHANNEL_DATA_HEADER_LEN, 0);
         reader.read_exact(&mut message).await?;
-        let Some(length) = stun::message_length(&message).filter(|length| *length <= MAX_MESSAGE)
-        else {
+        let length = if stun::is_channel_data(&message) {
+            stun::channel_data_length(&message)
+        } else {
+            message.resize(HEADER_LEN, 0);
+            reader
+                .read_exact(&mut message[CHANNEL_DATA_HEADER_LEN..])
+                .await?;
+            stun::message_length(&message)
+        };
+        let Some(length) = length.filter(|length| *length <= MAX_MESSAGE) else {
             return Ok(());
         };
+        let read = message.len();
         message.resize(length, 0);
-        reader.read_exact(&mut message[HEADER_LEN..]).await?;
+        reader.read_exact(&mut message[read..]).await?;
         network.receive(&message, client).await;
     }
 }

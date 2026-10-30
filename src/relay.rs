@@ -15,13 +15,13 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 use crate::stun::attribute::{
-    DATA, DONT_FRAGMENT, LIFETIME, MESSAGE_INTEGRITY, NONCE, REALM, REQUESTED_ADDRESS_FAMILY,
-    REQUESTED_TRANSPORT, SOFTWARE, UNKNOWN_ATTRIBUTES, USERNAME, XOR_MAPPED_ADDRESS,
-    XOR_PEER_ADDRESS, XOR_RELAYED_ADDRESS,
+    CHANNEL_NUMBER, DATA, DONT_FRAGMENT, LIFETIME, MESSAGE_INTEGRITY, NONCE, REALM,
+    REQUESTED_ADDRESS_FAMILY, REQUESTED_TRANSPORT, SOFTWARE, UNKNOWN_ATTRIBUTES, USERNAME,
+    XOR_MAPPED_ADDRESS, XOR_PEER_ADDRESS, XOR_RELAYED_ADDRESS,
 };
 use crate::stun::{
-    self, ALLOCATE, BINDING, Builder, CREATE_PERMISSION, Class, Message, REFRESH, SEND,
-    Transaction, long_term_key,
+    self, ALLOCATE, BINDING, Builder, CHANNEL_BIND, CHANNELS, CREATE_PERMISSION, Class, Message,
+    REFRESH, SEND, Transaction, long_term_key,
 };
 
 const REALM_TEXT: &str = "outpost";
@@ -33,6 +33,10 @@ const NONCE_LIFETIME: u64 = 3600;
 const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
 /// Permissions one allocation may hold. A browser asks for one per address of the other player.
 const MAX_PERMISSIONS: usize = 64;
+/// RFC 8656 §12 fixes it at ten minutes.
+const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
+/// Channels one allocation may bind. A browser binds one per address of the other player.
+const MAX_CHANNELS: usize = 64;
 /// Allocations per room. A browser allocates once per TURN URL and network interface (UDP and
 /// TCP, Wi-Fi and a VPN), and a reloaded page leaves its old allocation behind until it expires.
 /// Two players need room for all of that; relaying stays within the room whatever the number.
@@ -46,7 +50,7 @@ const IPV4: u8 = 0x01;
 /// The comprehension-required attributes outpost understands; any other one in a request is
 /// answered with 420 (RFC 8489 §6.3.1), and in an indication drops it. DONT-FRAGMENT is among
 /// them because relayed data never leaves this process, so it is never fragmented.
-const UNDERSTOOD: [u16; 10] = [
+const UNDERSTOOD: [u16; 11] = [
     USERNAME,
     MESSAGE_INTEGRITY,
     REALM,
@@ -57,6 +61,7 @@ const UNDERSTOOD: [u16; 10] = [
     DONT_FRAGMENT,
     XOR_PEER_ADDRESS,
     DATA,
+    CHANNEL_NUMBER,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -100,6 +105,13 @@ struct Allocation {
     expires: Instant,
     /// When each peer address's permission expires (RFC 8656 §9).
     permissions: HashMap<IpAddr, Instant>,
+    /// The channels bound by number (RFC 8656 §12).
+    channels: HashMap<u16, Channel>,
+}
+
+struct Channel {
+    peer: SocketAddr,
+    expires: Instant,
 }
 
 impl Allocation {
@@ -108,6 +120,50 @@ impl Allocation {
             .get(&peer)
             .is_some_and(|expires| *expires > now)
     }
+
+    /// Installs or renews a permission for each of `peers`: all of them, or none if they do not
+    /// fit (RFC 8656 §10.2). Answers whether they did.
+    fn grant(&mut self, peers: &[IpAddr], now: Instant) -> bool {
+        self.permissions.retain(|_, expires| *expires > now);
+        let mut new: Vec<IpAddr> = peers
+            .iter()
+            .filter(|ip| !self.permissions.contains_key(ip))
+            .copied()
+            .collect();
+        new.sort_unstable();
+        new.dedup();
+        if self.permissions.len() + new.len() > MAX_PERMISSIONS {
+            return false;
+        }
+        for peer in peers {
+            self.permissions.insert(*peer, now + PERMISSION_LIFETIME);
+        }
+        true
+    }
+
+    /// The peer bound to a live channel `number`.
+    fn channel(&self, number: u16, now: Instant) -> Option<SocketAddr> {
+        self.channels
+            .get(&number)
+            .filter(|channel| channel.expires > now)
+            .map(|channel| channel.peer)
+    }
+
+    /// The live channel bound to `peer`.
+    fn channel_to(&self, peer: SocketAddr, now: Instant) -> Option<u16> {
+        self.channels
+            .iter()
+            .find(|(_, channel)| channel.peer == peer && channel.expires > now)
+            .map(|(number, _)| *number)
+    }
+}
+
+/// Where relayed data goes: to which client, from which relayed address, and on which of the
+/// receiver's channels, if it has one bound to the sender.
+struct Forward {
+    to: Client,
+    from: SocketAddr,
+    channel: Option<u16>,
 }
 
 pub struct Relay {
@@ -233,7 +289,8 @@ impl Relay {
         match request.method() {
             ALLOCATE => self.allocate(request, client, room, now),
             REFRESH => self.refresh(request, client, room, now),
-            _ => self.create_permission(request, client, room, now),
+            CREATE_PERMISSION => self.create_permission(request, client, room, now),
+            _ => self.channel_bind(request, client, room, now),
         }
     }
 
@@ -271,6 +328,7 @@ impl Relay {
             transaction: request.transaction(),
             expires: now + Duration::from_secs(lifetime.into()),
             permissions: HashMap::new(),
+            channels: HashMap::new(),
         };
         self.allocations.insert(client, allocation);
         self.ports.insert(port, client);
@@ -332,37 +390,70 @@ impl Relay {
         if !peers.iter().all(SocketAddr::is_ipv4) {
             return error(request, 443, "Peer Address Family Mismatch");
         }
-        allocation.permissions.retain(|_, expires| *expires > now);
-        let mut new: Vec<IpAddr> = peers
-            .iter()
-            .map(SocketAddr::ip)
-            .filter(|ip| !allocation.permissions.contains_key(ip))
-            .collect();
-        new.sort_unstable();
-        new.dedup();
-        // All or nothing (RFC 8656 §10.2): a request that does not fit installs none of them.
-        if allocation.permissions.len() + new.len() > MAX_PERMISSIONS {
+        let ips: Vec<IpAddr> = peers.iter().map(SocketAddr::ip).collect();
+        if !allocation.grant(&ips, now) {
             return error(request, 508, "Insufficient Capacity");
-        }
-        for peer in peers {
-            allocation
-                .permissions
-                .insert(peer.ip(), now + PERMISSION_LIFETIME);
         }
         Builder::response(request, Class::Success)
     }
 
-    /// RFC 8656 §11.2, with the room rule (PLAN.md D1): the peer must be another live
-    /// allocation of the sender's room, the sender must have a permission for the peer, and the
-    /// peer one for the sender. Anything else is dropped silently. Answers the peer's client and
-    /// the sender's relayed address, which the Data indication comes from.
-    fn send(
-        &self,
-        indication: &Message,
+    /// RFC 8656 §12.2. Like a permission, a channel may be bound to any IPv4 peer, because data
+    /// on it still only reaches another allocation of the same room (`forward`).
+    fn channel_bind(
+        &mut self,
+        request: &Message,
         client: Client,
+        room: &str,
         now: Instant,
-    ) -> Option<(Client, SocketAddr)> {
-        let peer = indication.xor_address(XOR_PEER_ADDRESS)?;
+    ) -> Builder {
+        let Some(allocation) = self.live(client, now) else {
+            return error(request, 437, "Allocation Mismatch");
+        };
+        if allocation.room != room {
+            return error(request, 441, "Wrong Credentials");
+        }
+        let number = match request.attribute(CHANNEL_NUMBER) {
+            Some(&[high, low, _, _]) => u16::from_be_bytes([high, low]),
+            _ => return error(request, 400, "Bad Request"),
+        };
+        let Some(peer) = request.xor_address(XOR_PEER_ADDRESS) else {
+            return error(request, 400, "Bad Request");
+        };
+        if !CHANNELS.contains(&number) {
+            return error(request, 400, "Bad Request");
+        }
+        if !peer.is_ipv4() {
+            return error(request, 443, "Peer Address Family Mismatch");
+        }
+        allocation
+            .channels
+            .retain(|_, channel| channel.expires > now);
+        let bound_elsewhere = allocation
+            .channel(number, now)
+            .is_some_and(|bound| bound != peer)
+            || allocation
+                .channel_to(peer, now)
+                .is_some_and(|bound| bound != number);
+        if bound_elsewhere {
+            return error(request, 400, "Bad Request");
+        }
+        let new = !allocation.channels.contains_key(&number);
+        if new && allocation.channels.len() >= MAX_CHANNELS || !allocation.grant(&[peer.ip()], now)
+        {
+            return error(request, 508, "Insufficient Capacity");
+        }
+        let expires = now + CHANNEL_LIFETIME;
+        allocation
+            .channels
+            .insert(number, Channel { peer, expires });
+        Builder::response(request, Class::Success)
+    }
+
+    /// Where data from `client` to `peer` goes: RFC 8656 §11.2 and §12.6, with the room rule
+    /// (PLAN.md D1). The peer must be another live allocation of the sender's room, the sender
+    /// must have a permission for the peer, and the peer one for the sender. Anything else is
+    /// dropped silently.
+    fn forward(&self, client: Client, peer: SocketAddr, now: Instant) -> Option<Forward> {
         let public_ip = IpAddr::from(self.public_ip);
         if peer.ip() != public_ip {
             return None;
@@ -381,7 +472,21 @@ impl Relay {
         {
             return None;
         }
-        Some((to, SocketAddr::new(public_ip, sender.port)))
+        let from = SocketAddr::new(public_ip, sender.port);
+        Some(Forward {
+            to,
+            from,
+            channel: receiver.channel_to(from, now),
+        })
+    }
+
+    /// Where data on the sender's channel `number` goes, if it is bound.
+    fn forward_channel(&self, client: Client, number: u16, now: Instant) -> Option<Forward> {
+        let sender = self
+            .allocations
+            .get(&client)
+            .filter(|allocation| allocation.expires > now)?;
+        self.forward(client, sender.channel(number, now)?, now)
     }
 
     /// The client's allocation, if it has one that has not expired.
@@ -448,7 +553,7 @@ impl Relay {
 }
 
 /// What one message from `client` leads to, if anything: an answer to a request, or data for
-/// the other player from a Send indication. Responses, other indications, methods outpost does
+/// the other player from a Send indication or a ChannelData message. Responses, other indications, methods outpost does
 /// not serve and messages whose FINGERPRINT fails are dropped silently (RFC 8489 §6.3). Only
 /// TURN messages take the lock, and only for the relay's own work: reading, Binding, signing and
 /// fingerprinting happen outside it.
@@ -458,16 +563,19 @@ pub fn handle(
     client: Client,
     now: Instant,
 ) -> Option<Outgoing> {
+    if stun::is_channel_data(bytes) {
+        return channel_data(relay, bytes, client, now);
+    }
     let message = Message::parse(bytes)?;
     if message.fingerprint() == Some(false) {
         return None;
     }
     let (response, key) = match (message.class(), message.method()) {
         (Class::Request, BINDING) => (binding(&message, client), None),
-        (Class::Request, ALLOCATE | REFRESH | CREATE_PERMISSION) => {
+        (Class::Request, ALLOCATE | REFRESH | CREATE_PERMISSION | CHANNEL_BIND) => {
             relay.lock().unwrap().turn(&message, client, now)
         }
-        (Class::Indication, SEND) => return data_indication(relay, &message, client, now),
+        (Class::Indication, SEND) => return send(relay, &message, client, now),
         _ => return None,
     };
     let message = finish(response, key.as_ref().map(|key| &key[..]));
@@ -477,9 +585,9 @@ pub fn handle(
     })
 }
 
-/// The Data indication a Send indication becomes, if the relay lets it through. The checks
-/// that need no state come first, and the message is built after the lock is let go.
-fn data_indication(
+/// What a Send indication becomes, if the relay lets it through. The checks that need no state
+/// come first, and the message is built after the lock is let go.
+fn send(
     relay: &Mutex<Relay>,
     indication: &Message,
     client: Client,
@@ -488,13 +596,38 @@ fn data_indication(
     if unknown_attributes(indication).is_some() {
         return None;
     }
+    let peer = indication.xor_address(XOR_PEER_ADDRESS)?;
     let data = indication.attribute(DATA)?;
-    let (to, from) = relay.lock().unwrap().send(indication, client, now)?;
-    let message = Builder::new(stun::DATA, Class::Indication, rand::random())
-        .xor_address(XOR_PEER_ADDRESS, from)
-        .attribute(DATA, data)
-        .build();
-    Some(Outgoing { to, message })
+    let forward = relay.lock().unwrap().forward(client, peer, now)?;
+    Some(relayed(forward, data))
+}
+
+/// What a ChannelData message becomes, if its channel is bound and the relay lets it through.
+fn channel_data(
+    relay: &Mutex<Relay>,
+    bytes: &[u8],
+    client: Client,
+    now: Instant,
+) -> Option<Outgoing> {
+    let (number, data) = stun::parse_channel_data(bytes)?;
+    let forward = relay.lock().unwrap().forward_channel(client, number, now)?;
+    Some(relayed(forward, data))
+}
+
+/// Relayed data as the receiver gets it: on its channel to the sender if it has bound one
+/// (padded over TCP, RFC 8656 §12.5), and as a Data indication otherwise.
+fn relayed(forward: Forward, data: &[u8]) -> Outgoing {
+    let message = match forward.channel {
+        Some(number) => stun::channel_data(number, data, forward.to.transport == Transport::Tcp),
+        None => Builder::new(stun::DATA, Class::Indication, rand::random())
+            .xor_address(XOR_PEER_ADDRESS, forward.from)
+            .attribute(DATA, data)
+            .build(),
+    };
+    Outgoing {
+        to: forward.to,
+        message,
+    }
 }
 
 /// A Binding request needs no credentials.
@@ -668,6 +801,27 @@ mod tests {
             self.ask(request, client, now)
         }
 
+        fn bind(&mut self, client: Client, now: Instant, number: u16, peer: SocketAddr) -> Reply {
+            let nonce = self.nonce(client, now);
+            let request = signed(
+                CHANNEL_BIND,
+                &self.room.clone(),
+                &nonce,
+                *b"bind-it-now!",
+                |b| {
+                    b.attribute(CHANNEL_NUMBER, &channel_number(number))
+                        .xor_address(XOR_PEER_ADDRESS, peer)
+                },
+            );
+            self.ask(request, client, now)
+        }
+
+        /// What ChannelData from `client` on channel `number` leads to.
+        fn on_channel(&self, client: Client, now: Instant, number: u16) -> Option<Outgoing> {
+            let message = stun::channel_data(number, b"game data", false);
+            handle(&self.relay, &message, client, now)
+        }
+
         /// What a Send indication from `client` to `peer` leads to.
         fn send(&self, client: Client, now: Instant, peer: SocketAddr) -> Option<Outgoing> {
             handle(
@@ -693,6 +847,11 @@ mod tests {
                 );
             self.ask(request, client, now)
         }
+    }
+
+    fn channel_number(number: u16) -> [u8; 4] {
+        let [high, low] = number.to_be_bytes();
+        [high, low, 0, 0]
     }
 
     fn send_indication(peer: SocketAddr, data: &[u8]) -> Vec<u8> {
@@ -1117,7 +1276,7 @@ mod tests {
             Builder::new(BINDING, Class::Indication, *b"binding-test").build(),
             Builder::new(BINDING, Class::Success, *b"binding-test").build(),
             Builder::new(ALLOCATE, Class::Error, *b"binding-test").build(),
-            Builder::new(crate::stun::CHANNEL_BIND, Class::Request, *b"binding-test").build(),
+            Builder::new(0x00A, Class::Request, *b"binding-test").build(), // Connect (RFC 6062)
             broken_fingerprint,
             b"not stun at all, not stun at all".to_vec(),
         ] {
@@ -1308,5 +1467,181 @@ mod tests {
         let later = at(s.start, PERMISSION_LIFETIME.as_secs());
         let after_expiry = s.permit(client(1), later, &[peer(1003)]);
         assert_eq!(after_expiry.message().class(), Class::Success);
+    }
+
+    #[test]
+    fn a_channel_needs_an_allocation_a_number_in_range_and_an_ipv4_peer() {
+        let mut s = setup();
+        let peer: SocketAddr = "203.0.113.50:1234".parse().unwrap();
+        assert_eq!(s.bind(client(1), s.start, 0x4000, peer).code(), Some(437));
+        s.allocate(client(1), s.start);
+        for number in [0x3FFF, 0x5000, 0xFFFF] {
+            assert_eq!(
+                s.bind(client(1), s.start, number, peer).code(),
+                Some(400),
+                "{number:#x}"
+            );
+        }
+        let ipv6: SocketAddr = "[2001:db8::1]:1234".parse().unwrap();
+        assert_eq!(s.bind(client(1), s.start, 0x4000, ipv6).code(), Some(443));
+
+        let room = s.room.clone();
+        let nonce = s.nonce(client(1), s.start);
+        let without_number = signed(CHANNEL_BIND, &room, &nonce, *b"bind-it-now!", |b| {
+            b.xor_address(XOR_PEER_ADDRESS, peer)
+        });
+        let without_peer = signed(CHANNEL_BIND, &room, &nonce, *b"bind-it-now!", |b| {
+            b.attribute(CHANNEL_NUMBER, &channel_number(0x4000))
+        });
+        for request in [without_number, without_peer] {
+            assert_eq!(s.ask(request, client(1), s.start).code(), Some(400));
+        }
+
+        let bound = s.bind(client(1), s.start, 0x4000, peer);
+        assert_eq!(bound.message().class(), Class::Success);
+        assert!(bound.signed_with(&s.room));
+        s.room = s.relay().open_room();
+        assert_eq!(s.bind(client(1), s.start, 0x4000, peer).code(), Some(441));
+    }
+
+    #[test]
+    fn a_channel_and_its_peer_belong_to_each_other_until_the_binding_expires() {
+        let mut s = setup();
+        s.allocate(client(1), s.start);
+        // Outlive the channel, so that only the channel expires.
+        s.refresh(client(1), s.start, Some(MAX_LIFETIME));
+        let peer: SocketAddr = "203.0.113.50:1234".parse().unwrap();
+        let other: SocketAddr = "203.0.113.50:1235".parse().unwrap();
+        let ok = |reply: Reply| reply.message().class() == Class::Success;
+        assert!(ok(s.bind(client(1), s.start, 0x4000, peer)));
+        assert!(
+            ok(s.bind(client(1), at(s.start, 1), 0x4000, peer)),
+            "a refresh"
+        );
+        assert_eq!(s.bind(client(1), s.start, 0x4000, other).code(), Some(400));
+        assert_eq!(s.bind(client(1), s.start, 0x4001, peer).code(), Some(400));
+
+        let expired = at(s.start, 1 + CHANNEL_LIFETIME.as_secs());
+        assert!(ok(s.bind(client(1), expired, 0x4000, other)));
+        assert!(ok(s.bind(client(1), expired, 0x4001, peer)));
+    }
+
+    #[test]
+    fn channels_alone_let_data_through_and_it_arrives_on_the_receivers_channel() {
+        let mut s = setup();
+        let first = s.allocate(client(1), s.start).relayed();
+        let second = s.allocate(client(2), s.start).relayed();
+        s.bind(client(1), s.start, 0x4000, second);
+        s.bind(client(2), s.start, 0x4abc, first);
+
+        let outgoing = s.on_channel(client(1), s.start, 0x4000).expect("relayed");
+        assert_eq!(outgoing.to, client(2));
+        assert_eq!(
+            outgoing.message,
+            stun::channel_data(0x4abc, b"game data", false)
+        );
+
+        // A Send indication reaches a receiver with a channel on that channel too.
+        let outgoing = s.send(client(2), s.start, first).expect("relayed");
+        assert_eq!(
+            outgoing.message,
+            stun::channel_data(0x4000, b"game data", false)
+        );
+    }
+
+    #[test]
+    fn data_on_a_channel_reaches_a_receiver_without_one_as_a_data_indication() {
+        let mut s = setup();
+        let first = s.allocate(client(1), s.start).relayed();
+        let second = s.allocate(client(2), s.start).relayed();
+        s.bind(client(1), s.start, 0x4000, second);
+        s.permit(client(2), s.start, &[first]);
+        let outgoing = s.on_channel(client(1), s.start, 0x4000).expect("relayed");
+        let data = Message::parse(&outgoing.message).unwrap();
+        assert_eq!(
+            (data.method(), data.class()),
+            (stun::DATA, Class::Indication)
+        );
+        assert_eq!(data.xor_address(XOR_PEER_ADDRESS), Some(first));
+        assert_eq!(data.attribute(DATA), Some(&b"game data"[..]));
+    }
+
+    #[test]
+    fn channel_data_for_a_tcp_client_is_padded() {
+        let mut s = setup();
+        let over_tcp = Client {
+            transport: Transport::Tcp,
+            ..client(2)
+        };
+        let first = s.allocate(client(1), s.start).relayed();
+        let second = s.allocate(over_tcp, s.start).relayed();
+        s.bind(client(1), s.start, 0x4000, second);
+        s.bind(over_tcp, s.start, 0x4001, first);
+        let three_bytes = stun::channel_data(0x4000, b"abc", false);
+        let outgoing = handle(&s.relay, &three_bytes, client(1), s.start).expect("relayed");
+        assert_eq!(outgoing.message, stun::channel_data(0x4001, b"abc", true));
+        assert_eq!(outgoing.message.len(), 8);
+    }
+
+    #[test]
+    fn channel_data_goes_nowhere_unbound_expired_or_outside_the_room() {
+        let mut s = setup();
+        let [(first, first_relayed), (second, second_relayed)] = two_players(&mut s);
+        let foreign: SocketAddr = "203.0.113.50:1234".parse().unwrap();
+        s.bind(first, s.start, 0x4000, second_relayed);
+        s.bind(first, s.start, 0x4001, foreign);
+        s.bind(first, s.start, 0x4002, first_relayed);
+
+        let ours = s.room.clone();
+        s.room = s.relay().open_room();
+        let stranger = s.allocate(client(9), s.start).relayed();
+        s.permit(client(9), s.start, &[first_relayed]);
+        s.room = ours;
+        s.bind(first, s.start, 0x4003, stranger);
+
+        assert!(s.on_channel(first, s.start, 0x4000).is_some());
+        for number in [0x4001, 0x4002, 0x4003, 0x4fff] {
+            assert!(
+                s.on_channel(first, s.start, number).is_none(),
+                "{number:#x}"
+            );
+        }
+        assert!(
+            s.on_channel(second, s.start, 0x4000).is_none(),
+            "another allocation's channel"
+        );
+        let reserved = [0x50, 0x00, 0x00, 0x00];
+        assert!(handle(&s.relay, &reserved, first, s.start).is_none());
+
+        // Data on a channel renews neither it nor the permissions; renewing the permissions
+        // alone, and the allocations, keeps data flowing until the channel itself expires.
+        s.refresh(first, s.start, Some(MAX_LIFETIME));
+        s.refresh(second, s.start, Some(MAX_LIFETIME));
+        let renew = at(s.start, 400);
+        s.permit(first, renew, &[second_relayed]);
+        s.permit(second, renew, &[first_relayed]);
+        let lifetime = CHANNEL_LIFETIME.as_secs();
+        assert!(
+            s.on_channel(first, at(s.start, lifetime - 1), 0x4000)
+                .is_some()
+        );
+        assert!(s.on_channel(first, at(s.start, lifetime), 0x4000).is_none());
+    }
+
+    #[test]
+    fn an_allocation_binds_a_bounded_number_of_channels() {
+        let mut s = setup();
+        s.allocate(client(1), s.start);
+        let peer = |n: u16| SocketAddr::from(([10, 0, 0, 1], n));
+        for n in 0..MAX_CHANNELS as u16 {
+            let reply = s.bind(client(1), s.start, 0x4000 + n, peer(n));
+            assert_eq!(reply.message().class(), Class::Success);
+        }
+        assert_eq!(
+            s.bind(client(1), s.start, 0x4fff, peer(999)).code(),
+            Some(508)
+        );
+        let refresh = s.bind(client(1), s.start, 0x4000, peer(0));
+        assert_eq!(refresh.message().class(), Class::Success);
     }
 }

@@ -160,6 +160,17 @@ path (23–81 ms after the answer). Decisions on the way:
   still being cleaned up takes the address over and ends the old allocation, and the old
   connection then cleans up only what is still its own.
 
+**4c done (2026-10-30).** Chrome binds channels and sends most of its data as ChannelData, over
+UDP and TCP; Firefox uses only Send indications. Both opened their data channels through a
+local outpost in every run. Decisions on the way:
+- A channel can be bound to any IPv4 peer and installs a permission for it, under the same
+  all-or-nothing cap of 64 permissions; data on it still reaches only another allocation of
+  the same room. An allocation binds at most 64 channels.
+- Relayed data reaches the receiver on its channel to the sender if it has one, whichever way
+  it was sent, and as a Data indication otherwise.
+- Over TCP the first four bytes tell ChannelData from STUN; ChannelData is padded to four
+  bytes there and not over UDP.
+
 - Allocations with long-term credential authentication (realm, nonce).
 - Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData.
 - The same requests over TCP 3478, with RFC 8656's framing (D3).
