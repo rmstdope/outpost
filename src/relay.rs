@@ -271,9 +271,7 @@ impl Relay {
         let rooms = &self.rooms;
         let ended = |allocation: &Allocation| {
             allocation.expires <= now
-                || rooms
-                    .get(&allocation.room)
-                    .is_none_or(|room| room.expires <= now)
+                || rooms.get(&allocation.room).is_none()
         };
         let expired: Vec<Client> = self
             .allocations

@@ -27,7 +27,9 @@ jobs:
         run: cargo test --locked
 
   container:
-    runs-on: ubuntu-latest
+    # Playwright 1.60 installs its browsers on Ubuntu 24.04 but not yet on 26.04, which is what
+    # ubuntu-latest is now.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     needs: rust
     steps:
