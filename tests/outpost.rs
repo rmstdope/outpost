@@ -263,30 +263,33 @@ async fn both_players_of_a_room_get_relayed_addresses_over_udp_and_tcp() {
 #[tokio::test]
 async fn a_closed_tcp_connection_gives_its_place_in_the_room_back() {
     let outpost = start("test").await;
-    let mut first = Line::tcp(outpost.tcp).await;
-    let mut second = Line::udp(outpost.udp).await;
-    let mut third = Line::udp(outpost.udp).await;
-    first.allocate(&outpost.room).await;
-    second.allocate(&outpost.room).await;
-    let full = third.allocate(&outpost.room).await;
-    assert_eq!(error_code(&Message::parse(&full).unwrap()), Some(486));
+    let mut over_tcp = Line::tcp(outpost.tcp).await;
+    let reply = over_tcp.allocate(&outpost.room).await;
+    assert_eq!(Message::parse(&reply).unwrap().class(), Class::Success);
+    // Fill the rest of the room over UDP.
+    let mut lines = vec![];
+    loop {
+        let mut line = Line::udp(outpost.udp).await;
+        let reply = line.allocate(&outpost.room).await;
+        match error_code(&Message::parse(&reply).unwrap()) {
+            None => lines.push(line),
+            Some(code) => {
+                assert_eq!(code, 486);
+                break;
+            }
+        }
+    }
 
-    drop(first);
-    let reply = within(async {
+    drop(over_tcp);
+    within(async {
         loop {
-            let mut fourth = Line::udp(outpost.udp).await;
-            let reply = fourth.allocate(&outpost.room).await;
+            let mut line = Line::udp(outpost.udp).await;
+            let reply = line.allocate(&outpost.room).await;
             if Message::parse(&reply).unwrap().class() == Class::Success {
-                return reply;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await;
-    assert!(
-        Message::parse(&reply)
-            .unwrap()
-            .xor_address(XOR_RELAYED_ADDRESS)
-            .is_some()
-    );
 }

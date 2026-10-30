@@ -6,8 +6,9 @@
 //! allocation for each.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::RangeInclusive;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -27,8 +28,10 @@ const SOFTWARE_TEXT: &[u8] = b"outpost";
 const DEFAULT_LIFETIME: u32 = 600;
 const MAX_LIFETIME: u32 = 3600;
 const NONCE_LIFETIME: u64 = 3600;
-/// Allocations per room: one for each player.
-const ROOM_SIZE: usize = 2;
+/// Allocations per room. A browser allocates once per TURN URL and network interface (UDP and
+/// TCP, Wi-Fi and a VPN), and a reloaded page leaves its old allocation behind until it expires.
+/// Two players need room for all of that; relaying stays within the room whatever the number.
+const ROOM_SIZE: usize = 8;
 /// Relayed ports come from the dynamic range (RFC 8656 §7.2). Nothing listens on them: an
 /// allocation is reached only through outpost, by its address.
 const PORTS: RangeInclusive<u16> = 49152..=65535;
@@ -85,7 +88,7 @@ struct Allocation {
 
 pub struct Relay {
     /// The address relayed addresses are given on: the one players reach outpost at.
-    public_ip: IpAddr,
+    public_ip: Ipv4Addr,
     rooms: HashMap<String, Room>,
     allocations: HashMap<Client, Allocation>,
     ports: HashMap<u16, Client>,
@@ -94,7 +97,7 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub fn new(public_ip: IpAddr, now: Instant) -> Self {
+    pub fn new(public_ip: Ipv4Addr, now: Instant) -> Self {
         Relay {
             public_ip,
             rooms: HashMap::new(),
@@ -120,27 +123,20 @@ impl Relay {
         credentials
     }
 
-    /// The reply to one message from `client`, if it gets one. Responses, indications, methods
-    /// outpost does not serve and messages whose FINGERPRINT fails are dropped silently
-    /// (RFC 8489 §6.3).
-    pub fn handle(&mut self, message: &[u8], client: Client, now: Instant) -> Option<Vec<u8>> {
-        let request = Message::parse(message)?;
-        if request.class() != Class::Request || request.fingerprint() == Some(false) {
-            return None;
+    /// The response to a TURN request, and the key to sign it with if it logged in.
+    fn turn(
+        &mut self,
+        request: &Message,
+        client: Client,
+        now: Instant,
+    ) -> (Builder, Option<[u8; 16]>) {
+        match self.authenticate(request, client, now) {
+            Err(refusal) => (refusal, None),
+            Ok(room) => {
+                let key = self.rooms[&room].key;
+                (self.authenticated(request, client, &room, now), Some(key))
+            }
         }
-        let reply = match request.method() {
-            BINDING => finish(binding(&request, client), None),
-            ALLOCATE | REFRESH => match self.authenticate(&request, client, now) {
-                Err(refusal) => finish(refusal, None),
-                Ok(room) => {
-                    let key = self.rooms[&room].key;
-                    let response = self.authenticated(&request, client, &room, now);
-                    finish(response, Some(&key))
-                }
-            },
-            _ => return None,
-        };
-        Some(reply)
     }
 
     /// Forgets the allocation of a client whose TCP connection has closed.
@@ -174,6 +170,8 @@ impl Relay {
                 .attribute(REALM, REALM_TEXT.as_bytes())
                 .attribute(NONCE, self.nonce(client, now).as_bytes())
         };
+        // Only MESSAGE-INTEGRITY counts. MESSAGE-INTEGRITY-SHA256 is for clients that saw a nonce
+        // cookie offering it, and outpost's nonces offer none.
         if request.attribute(MESSAGE_INTEGRITY).is_none() {
             return Err(challenge(401, "Unauthenticated"));
         }
@@ -219,7 +217,7 @@ impl Relay {
     /// RFC 8656 §7.2.
     fn allocate(&mut self, request: &Message, client: Client, room: &str, now: Instant) -> Builder {
         if let Some(allocation) = self.live(client, now) {
-            return if allocation.transaction == request.transaction() {
+            return if allocation.transaction == request.transaction() && allocation.room == room {
                 self.allocated(request, client, now)
             } else {
                 error(request, 437, "Allocation Mismatch")
@@ -235,6 +233,8 @@ impl Relay {
             Some([_, _, _, _]) => return error(request, 440, "Address Family not Supported"),
             Some(_) => return error(request, 400, "Bad Request"),
         }
+        // An expired allocation not yet swept must not hold a place in the room.
+        self.sweep(now);
         if self.rooms[room].allocations >= ROOM_SIZE {
             return error(request, 486, "Allocation Quota Reached");
         }
@@ -256,7 +256,7 @@ impl Relay {
 
     fn allocated(&self, request: &Message, client: Client, now: Instant) -> Builder {
         let allocation = &self.allocations[&client];
-        let relayed = SocketAddr::new(self.public_ip, allocation.port);
+        let relayed = SocketAddr::from((self.public_ip, allocation.port));
         let lifetime = allocation.expires.saturating_duration_since(now).as_secs() as u32;
         Builder::response(request, Class::Success)
             .xor_address(XOR_RELAYED_ADDRESS, relayed)
@@ -349,6 +349,28 @@ impl Relay {
     }
 }
 
+/// The reply to one message from `client`, if it gets one. Responses, indications, methods
+/// outpost does not serve and messages whose FINGERPRINT fails are dropped silently
+/// (RFC 8489 §6.3). Only TURN requests take the lock, and only for the relay's own work: reading,
+/// Binding, signing and fingerprinting happen outside it.
+pub fn handle(
+    relay: &Mutex<Relay>,
+    message: &[u8],
+    client: Client,
+    now: Instant,
+) -> Option<Vec<u8>> {
+    let request = Message::parse(message)?;
+    if request.class() != Class::Request || request.fingerprint() == Some(false) {
+        return None;
+    }
+    let (response, key) = match request.method() {
+        BINDING => (binding(&request, client), None),
+        ALLOCATE | REFRESH => relay.lock().unwrap().turn(&request, client, now),
+        _ => return None,
+    };
+    Some(finish(response, key.as_ref().map(|key| &key[..])))
+}
+
 /// A Binding request needs no credentials.
 fn binding(request: &Message, client: Client) -> Builder {
     unknown_attributes(request, None).unwrap_or_else(|| {
@@ -358,16 +380,14 @@ fn binding(request: &Message, client: Client) -> Builder {
 
 /// A 420 naming the comprehension-required attributes outpost does not understand, if any.
 fn unknown_attributes(request: &Message, also: Option<u16>) -> Option<Builder> {
-    let mut unknown = vec![];
-    for attribute in request.attributes() {
-        if attribute.kind < 0x8000
-            && !UNDERSTOOD.contains(&attribute.kind)
-            && also != Some(attribute.kind)
-            && !unknown.contains(&attribute.kind)
-        {
-            unknown.push(attribute.kind);
-        }
-    }
+    let mut unknown: Vec<u16> = request
+        .attributes()
+        .map(|attribute| attribute.kind)
+        .filter(|kind| *kind < 0x8000 && !UNDERSTOOD.contains(kind) && also != Some(*kind))
+        .collect();
+    // Sorting rather than searching keeps a message of thousands of attributes cheap.
+    unknown.sort_unstable();
+    unknown.dedup();
     if unknown.is_empty() {
         return None;
     }
@@ -424,7 +444,7 @@ mod tests {
     }
 
     struct Setup {
-        relay: Relay,
+        relay: Mutex<Relay>,
         room: Credentials,
         start: Instant,
     }
@@ -433,7 +453,11 @@ mod tests {
         let start = Instant::now();
         let mut relay = Relay::new(PUBLIC_IP.into(), start);
         let room = relay.open_room();
-        Setup { relay, room, start }
+        Setup {
+            relay: Mutex::new(relay),
+            room,
+            start,
+        }
     }
 
     fn at(start: Instant, seconds: u64) -> Instant {
@@ -476,8 +500,12 @@ mod tests {
     }
 
     impl Setup {
+        fn relay(&mut self) -> &mut Relay {
+            self.relay.get_mut().unwrap()
+        }
+
         fn ask(&mut self, request: Vec<u8>, client: Client, now: Instant) -> Reply {
-            let bytes = self.relay.handle(&request, client, now).expect("an answer");
+            let bytes = handle(&self.relay, &request, client, now).expect("an answer");
             Reply { bytes }
         }
 
@@ -555,8 +583,16 @@ mod tests {
 
         let again = s.nonce(client(1), s.start);
         let other = s.nonce(client(2), s.start);
+        let over_tcp = s.nonce(
+            Client {
+                transport: Transport::Tcp,
+                ..client(1)
+            },
+            s.start,
+        );
         assert_eq!(challenge.nonce(), again);
         assert_ne!(challenge.nonce(), other, "no two clients share a nonce");
+        assert_ne!(challenge.nonce(), over_tcp, "nor two transports");
     }
 
     #[test]
@@ -569,7 +605,7 @@ mod tests {
             (ALLOCATE, Class::Success)
         );
         assert_eq!(message.transaction(), *b"allocate-it!");
-        assert_eq!(reply.relayed().ip(), IpAddr::from(PUBLIC_IP));
+        assert_eq!(reply.relayed().ip(), Ipv4Addr::from(PUBLIC_IP));
         assert!(PORTS.contains(&reply.relayed().port()));
         assert_eq!(reply.lifetime(), DEFAULT_LIFETIME);
         assert_eq!(message.mapped_address(), Some(client(1).address));
@@ -603,15 +639,25 @@ mod tests {
     fn a_signed_request_without_username_realm_or_nonce_is_a_bad_request() {
         let mut s = setup();
         let key = long_term_key(&s.room.username, REALM_TEXT, &s.room.password);
-        let request = udp(Builder::new(ALLOCATE, Class::Request, *b"allocate-it!"))
-            .attribute(USERNAME, s.room.username.as_bytes())
-            .attribute(REALM, REALM_TEXT.as_bytes())
-            .integrity(&key)
-            .fingerprint();
-        let reply = s.ask(request, client(1), s.start);
-        assert_eq!(reply.code(), Some(400));
-        assert_eq!(reply.message().attribute(NONCE), None);
-        assert_eq!(reply.message().attribute(REALM), None);
+        let nonce = s.nonce(client(1), s.start);
+        let username = s.room.username.clone();
+        let login = [
+            (USERNAME, username.as_bytes()),
+            (REALM, REALM_TEXT.as_bytes()),
+            (NONCE, &nonce[..]),
+        ];
+        for missing in [USERNAME, REALM, NONCE] {
+            let mut request = udp(Builder::new(ALLOCATE, Class::Request, *b"allocate-it!"));
+            for (kind, value) in login {
+                if kind != missing {
+                    request = request.attribute(kind, value);
+                }
+            }
+            let reply = s.ask(request.integrity(&key).fingerprint(), client(1), s.start);
+            assert_eq!(reply.code(), Some(400), "without {missing:#06x}");
+            assert_eq!(reply.message().attribute(NONCE), None);
+            assert_eq!(reply.message().attribute(REALM), None);
+        }
     }
 
     #[test]
@@ -708,23 +754,42 @@ mod tests {
         assert_eq!(again.lifetime(), DEFAULT_LIFETIME - 10);
 
         let another = signed(ALLOCATE, &room, &nonce, *b"another-one!", udp);
-        assert_eq!(s.ask(another, client(1), s.start).code(), Some(437));
+        assert_eq!(s.ask(another, client(1), at(s.start, 20)).code(), Some(437));
+
+        // The same transaction logged in to another room is not a retransmission.
+        let other_room = s.relay().open_room();
+        let from_other_room = signed(ALLOCATE, &other_room, &nonce, *b"allocate-it!", udp);
+        assert_eq!(
+            s.ask(from_other_room, client(1), at(s.start, 30)).code(),
+            Some(437)
+        );
     }
 
     #[test]
-    fn a_room_holds_two_allocations_with_different_relayed_addresses() {
+    fn a_room_holds_its_allocations_on_different_relayed_addresses_up_to_its_size() {
         let mut s = setup();
-        let first = s.allocate(client(1), s.start);
-        let second = s.allocate(client(2), s.start);
-        assert_ne!(first.relayed(), second.relayed());
-        assert_eq!(s.allocate(client(3), s.start).code(), Some(486));
+        let mut relayed = std::collections::HashSet::new();
+        for port in 0..ROOM_SIZE as u16 {
+            relayed.insert(s.allocate(client(port), s.start).relayed());
+        }
+        assert_eq!(relayed.len(), ROOM_SIZE);
+        assert_eq!(s.allocate(client(100), s.start).code(), Some(486));
 
         // Another room is not affected.
-        s.room = s.relay.open_room();
-        assert_eq!(
-            s.allocate(client(3), s.start).message().class(),
-            Class::Success
-        );
+        s.room = s.relay().open_room();
+        let reply = s.allocate(client(100), s.start);
+        assert_eq!(reply.message().class(), Class::Success);
+    }
+
+    #[test]
+    fn an_expired_allocation_does_not_hold_a_place_before_it_is_swept() {
+        let mut s = setup();
+        for port in 0..ROOM_SIZE as u16 {
+            s.allocate(client(port), s.start);
+        }
+        let later = at(s.start, u64::from(DEFAULT_LIFETIME));
+        let reply = s.allocate(client(100), later);
+        assert_eq!(reply.message().class(), Class::Success);
     }
 
     #[test]
@@ -771,10 +836,38 @@ mod tests {
     }
 
     #[test]
+    fn an_allocate_asking_for_lifetime_zero_gets_the_default() {
+        let mut s = setup();
+        let room = s.room.clone();
+        let nonce = s.nonce(client(1), s.start);
+        let request = signed(ALLOCATE, &room, &nonce, *b"allocate-it!", |b| {
+            udp(b).attribute(LIFETIME, &[0, 0, 0, 0])
+        });
+        assert_eq!(
+            s.ask(request, client(1), s.start).lifetime(),
+            DEFAULT_LIFETIME
+        );
+        let alive = s.refresh(client(1), at(s.start, 1), None);
+        assert_eq!(alive.message().class(), Class::Success);
+    }
+
+    #[test]
+    fn a_refresh_for_another_address_family_is_a_443() {
+        let mut s = setup();
+        s.allocate(client(1), s.start);
+        let room = s.room.clone();
+        let nonce = s.nonce(client(1), s.start);
+        let request = signed(REFRESH, &room, &nonce, *b"refresh-it!!", |b| {
+            b.attribute(REQUESTED_ADDRESS_FAMILY, &[0x02, 0, 0, 0])
+        });
+        assert_eq!(s.ask(request, client(1), s.start).code(), Some(443));
+    }
+
+    #[test]
     fn a_refresh_from_another_room_is_refused() {
         let mut s = setup();
         s.allocate(client(1), s.start);
-        s.room = s.relay.open_room();
+        s.room = s.relay().open_room();
         assert_eq!(s.refresh(client(1), s.start, None).code(), Some(441));
     }
 
@@ -790,15 +883,18 @@ mod tests {
             Class::Success
         );
 
-        s.relay.disconnect(client(2));
+        s.relay().disconnect(client(2));
         assert_eq!(
             s.allocate(client(4), s.start).message().class(),
             Class::Success
         );
 
-        s.relay.sweep(at(s.start, u64::from(DEFAULT_LIFETIME)));
-        assert!(s.relay.allocations.is_empty() && s.relay.ports.is_empty());
-        assert_eq!(s.relay.rooms[&s.room.username].allocations, 0);
+        let expired = at(s.start, u64::from(DEFAULT_LIFETIME));
+        s.relay().sweep(expired);
+        let username = s.room.username.clone();
+        let relay = s.relay();
+        assert!(relay.allocations.is_empty() && relay.ports.is_empty());
+        assert_eq!(relay.rooms[&username].allocations, 0);
     }
 
     #[test]
@@ -835,7 +931,7 @@ mod tests {
 
     #[test]
     fn what_is_not_a_request_outpost_serves_gets_no_answer() {
-        let mut s = setup();
+        let s = setup();
         let mut broken_fingerprint =
             Builder::new(BINDING, Class::Request, *b"binding-test").fingerprint();
         broken_fingerprint[8] ^= 1;
@@ -848,7 +944,7 @@ mod tests {
             b"not stun at all, not stun at all".to_vec(),
         ] {
             assert!(
-                s.relay.handle(&bytes, client(1), s.start).is_none(),
+                handle(&s.relay, &bytes, client(1), s.start).is_none(),
                 "{bytes:02x?}"
             );
         }

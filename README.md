@@ -10,7 +10,8 @@ So far outpost is a STUN server (RFC 8489) that also hands out TURN allocations 
   address;
 - Allocate and Refresh need a room's credentials (the long-term credential mechanism, realm
   `outpost`). A room is one username and password, shared by its two players, and holds at
-  most one allocation for each. Relaying data between them comes in PLAN.md step 4b.
+  most eight allocations: a browser allocates once per TURN URL and network interface, and a
+  reloaded page leaves its old allocation behind until it expires. Relaying data between them comes in PLAN.md step 4b.
 
 How it answers, over UDP and TCP alike:
 - every response ends in a FINGERPRINT and names `outpost` as its SOFTWARE;
@@ -35,7 +36,7 @@ cargo test                     # unit and end-to-end tests
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `OUTPOST_REVISION` | `unknown` | Source commit served from `/release.json`; the image sets it at build time. |
-| `OUTPOST_PUBLIC_IP` | `127.0.0.1` | The address players reach port 3478 at. Relayed addresses are given on it, so production must set it. |
+| `OUTPOST_PUBLIC_IP` | `127.0.0.1` | The IPv4 address players reach port 3478 at. Relayed addresses are given on it, so production must set it; the startup log shows the one in use. |
 
 ## Ports
 

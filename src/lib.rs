@@ -9,7 +9,7 @@ mod web;
 
 use std::future::{Future, IntoFuture};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,9 +28,9 @@ pub struct Config {
     pub turn: SocketAddr,
     /// How long `/healthz` waits for the TURN port to answer.
     pub probe_timeout: Duration,
-    /// The address players reach the TURN port at, given as the address of their relayed
+    /// The IPv4 address players reach the TURN port at, given as the address of their relayed
     /// connections.
-    pub public_ip: IpAddr,
+    pub public_ip: Ipv4Addr,
 }
 
 impl Default for Config {
@@ -40,7 +40,7 @@ impl Default for Config {
             web: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080)),
             turn: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 3478)),
             probe_timeout: Duration::from_secs(1),
-            public_ip: Ipv4Addr::LOCALHOST.into(),
+            public_ip: Ipv4Addr::LOCALHOST,
         }
     }
 }
@@ -55,7 +55,7 @@ impl Config {
         if let Ok(ip) = std::env::var("OUTPOST_PUBLIC_IP") {
             config.public_ip = ip
                 .parse()
-                .map_err(|_| format!("OUTPOST_PUBLIC_IP is not an IP address: {ip}"))?;
+                .map_err(|_| format!("OUTPOST_PUBLIC_IP is not an IPv4 address: {ip}"))?;
         }
         Ok(config)
     }
@@ -69,6 +69,7 @@ pub struct Outpost {
     udp: UdpSocket,
     tcp: TcpListener,
     relay: turn::Shared,
+    public_ip: Ipv4Addr,
 }
 
 impl Outpost {
@@ -83,7 +84,13 @@ impl Outpost {
                 config.public_ip,
                 Instant::now(),
             ))),
+            public_ip: config.public_ip,
         })
+    }
+
+    /// The address relayed addresses are given on.
+    pub fn public_ip(&self) -> Ipv4Addr {
+        self.public_ip
     }
 
     /// Opens a room and returns the credentials both of its players log in with.

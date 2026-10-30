@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use crate::relay::{Client, Relay, Transport};
+use crate::relay::{self, Client, Relay, Transport};
 use crate::stun::{self, HEADER_LEN};
 
 pub type Shared = Arc<Mutex<Relay>>;
@@ -30,10 +30,7 @@ pub async fn serve_udp(socket: UdpSocket, relay: Shared) -> io::Result<()> {
             address: from,
             transport: Transport::Udp,
         };
-        let reply = relay
-            .lock()
-            .unwrap()
-            .handle(&datagram[..size], client, Instant::now());
+        let reply = relay::handle(&relay, &datagram[..size], client, Instant::now());
         if let Some(reply) = reply {
             // A reply that cannot be sent is the client's loss, not the listener's.
             let _ = socket.send_to(&reply, from).await;
@@ -77,10 +74,7 @@ async fn messages(stream: &mut TcpStream, client: Client, relay: &Shared) -> io:
         };
         message.resize(length, 0);
         stream.read_exact(&mut message[HEADER_LEN..]).await?;
-        let reply = relay
-            .lock()
-            .unwrap()
-            .handle(&message, client, Instant::now());
+        let reply = relay::handle(relay, &message, client, Instant::now());
         if let Some(reply) = reply {
             stream.write_all(&reply).await?;
         }
