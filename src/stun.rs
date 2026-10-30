@@ -171,7 +171,20 @@ impl<'a> Message<'a> {
 
     /// An address attribute in the XOR-MAPPED-ADDRESS format (§14.2).
     pub fn xor_address(&self, kind: u16) -> Option<SocketAddr> {
-        let value = self.attribute(kind)?;
+        self.xor_address_value(self.attribute(kind)?)
+    }
+
+    /// Every attribute of type `kind`, read as an address; `None` for one that is malformed.
+    pub fn xor_addresses(
+        &self,
+        kind: u16,
+    ) -> impl Iterator<Item = Option<SocketAddr>> + use<'_, 'a> {
+        self.attributes()
+            .filter(move |attribute| attribute.kind == kind)
+            .map(|attribute| self.xor_address_value(attribute.value))
+    }
+
+    fn xor_address_value(&self, value: &[u8]) -> Option<SocketAddr> {
         let port =
             u16::from_be_bytes([*value.get(2)?, *value.get(3)?]) ^ (MAGIC_COOKIE >> 16) as u16;
         let mut address = value.get(4..)?.to_vec();
@@ -573,6 +586,25 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn every_address_of_a_kind_is_read_and_a_malformed_one_is_none() {
+        let bytes = Builder::new(BINDING, Class::Request, SAMPLE)
+            .xor_address(XOR_MAPPED_ADDRESS, "192.0.2.1:32853".parse().unwrap())
+            .attribute(XOR_MAPPED_ADDRESS, &[0, 1, 0])
+            .xor_address(XOR_MAPPED_ADDRESS, "[2001:db8::1]:1".parse().unwrap())
+            .build();
+        let message = Message::parse(&bytes).unwrap();
+        let addresses: Vec<_> = message.xor_addresses(XOR_MAPPED_ADDRESS).collect();
+        assert_eq!(
+            addresses,
+            [
+                Some("192.0.2.1:32853".parse().unwrap()),
+                None,
+                Some("[2001:db8::1]:1".parse().unwrap())
+            ]
+        );
     }
 
     #[test]

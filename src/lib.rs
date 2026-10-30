@@ -10,7 +10,6 @@ mod web;
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, UdpSocket};
@@ -66,24 +65,20 @@ pub struct Outpost {
     revision: String,
     probe_timeout: Duration,
     web: TcpListener,
-    udp: UdpSocket,
     tcp: TcpListener,
-    relay: turn::Shared,
+    network: turn::Shared,
     public_ip: Ipv4Addr,
 }
 
 impl Outpost {
     pub async fn bind(config: Config) -> io::Result<Outpost> {
+        let relay = relay::Relay::new(config.public_ip, Instant::now());
         Ok(Outpost {
             web: TcpListener::bind(config.web).await?,
-            udp: UdpSocket::bind(config.turn).await?,
+            network: turn::Network::new(relay, UdpSocket::bind(config.turn).await?),
             tcp: TcpListener::bind(config.turn).await?,
             revision: config.revision,
             probe_timeout: config.probe_timeout,
-            relay: Arc::new(Mutex::new(relay::Relay::new(
-                config.public_ip,
-                Instant::now(),
-            ))),
             public_ip: config.public_ip,
         })
     }
@@ -95,7 +90,7 @@ impl Outpost {
 
     /// Opens a room and returns the credentials both of its players log in with.
     pub fn open_room(&self) -> Credentials {
-        self.relay.lock().unwrap().open_room()
+        self.network.relay.lock().unwrap().open_room()
     }
 
     pub fn web_addr(&self) -> SocketAddr {
@@ -105,7 +100,8 @@ impl Outpost {
     }
 
     pub fn udp_addr(&self) -> SocketAddr {
-        self.udp
+        self.network
+            .udp
             .local_addr()
             .expect("a bound socket has an address")
     }
@@ -122,9 +118,9 @@ impl Outpost {
         let app = app(self.revision.clone(), self.probe(), self.probe_timeout);
         tokio::select! {
             result = axum::serve(self.web, app).into_future() => result,
-            result = turn::serve_udp(self.udp, self.relay.clone()) => result,
-            result = turn::serve_tcp(self.tcp, self.relay.clone()) => result,
-            result = turn::sweep(self.relay) => result,
+            result = turn::serve_udp(self.network.clone()) => result,
+            result = turn::serve_tcp(self.tcp, self.network.clone()) => result,
+            result = turn::sweep(self.network) => result,
             () = shutdown => Ok(()),
         }
     }
