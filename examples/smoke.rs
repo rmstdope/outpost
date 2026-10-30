@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use outpost::stun::{self, Message};
+use outpost::stun::{self, Class, Message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -17,8 +17,8 @@ async fn within<T>(future: impl Future<Output = T>) -> T {
 
 fn mapped(reply: &[u8], transaction: stun::Transaction) -> SocketAddr {
     let reply = Message::parse(reply).expect("a STUN message");
-    assert!(reply.is_binding_success());
-    assert_eq!(reply.transaction, transaction);
+    assert_eq!(reply.class(), Class::Success);
+    assert_eq!(reply.transaction(), transaction);
     reply.mapped_address().expect("a mapped address")
 }
 

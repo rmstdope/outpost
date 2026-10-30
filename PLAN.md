@@ -116,6 +116,10 @@ The rest of RFC 8489 that step 4 relies on:
 - error responses, including 420 for unknown comprehension-required attributes;
 - ignoring what is not addressed to a server (responses, unknown classes).
 
+**Done (2026-10-30).** RFC 8489 §6.3 settled one point: a server drops requests for methods it
+does not serve silently, rather than answering them with an error. Chrome and Firefox both
+gathered through a local outpost as their STUN server.
+
 ### 4. TURN relay (outpost)
 
 - Allocations with long-term credential authentication (realm, nonce).

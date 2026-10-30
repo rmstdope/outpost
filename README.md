@@ -5,8 +5,15 @@ TURN relay for NESER network play. When two players' networks cannot be connecte
 through outpost instead. outpost relays only between the two players of one room, never to any
 other address. How it gets there is in [PLAN.md](PLAN.md).
 
-So far outpost answers STUN Binding requests (RFC 8489), which tell a browser its public address.
-The relay itself comes in PLAN.md step 4.
+So far outpost is a STUN server (RFC 8489): it answers Binding requests with the address they
+came from, which tells a browser its public address. The relay itself comes in PLAN.md step 4.
+
+How it answers, over UDP and TCP alike:
+- every response ends in a FINGERPRINT and names `outpost` as its SOFTWARE;
+- a request whose FINGERPRINT fails is dropped, as is anything that is not a request, or a
+  request for a method outpost does not serve;
+- a request carrying a comprehension-required attribute outpost does not know gets a 420 (Unknown
+  Attribute) naming it.
 
 ## Running
 
@@ -47,4 +54,6 @@ Unlike liaison, outpost publishes a port of its own and a restart drops the game
 so it is a reviewed definition in `rmstdope-infra` and released by hand, never automatically
 (PLAN.md steps 6 and 7).
 
-The STUN message code is our own (`src/stun.rs`): the subset outpost needs is small.
+The STUN message code is our own (`src/stun.rs`): the subset outpost needs is small. It is
+checked against the sample messages of RFC 5769, and uses crates only for MD5, HMAC-SHA1 and
+CRC32.
