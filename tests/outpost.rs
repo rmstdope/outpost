@@ -868,3 +868,34 @@ async fn rooms_opened_too_fast_are_refused() {
     assert_eq!(http(outpost.internal, "POST", "/rooms").await.0, 200);
     assert_eq!(http(outpost.internal, "POST", "/rooms").await.0, 429);
 }
+
+#[tokio::test]
+async fn rooms_refused_say_why_and_when_to_try_again() {
+    let full = start_with(
+        "test",
+        Limits {
+            rooms: 1,
+            ..Limits::default()
+        },
+    )
+    .await;
+    // `start` opened the one room.
+    let (status, head, _) = http(full.internal, "POST", "/rooms").await;
+    assert_eq!(status, 503);
+    assert!(head.contains("retry-after: 60"), "{head}");
+
+    let busy = start_with(
+        "test",
+        Limits {
+            rooms_opened: Rate {
+                per_second: 0.0,
+                burst: 1.0,
+            },
+            ..Limits::default()
+        },
+    )
+    .await;
+    let (status, head, _) = http(busy.internal, "POST", "/rooms").await;
+    assert_eq!(status, 429);
+    assert!(head.contains("retry-after: 1"), "{head}");
+}

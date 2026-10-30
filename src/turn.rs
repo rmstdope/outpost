@@ -195,7 +195,11 @@ async fn connection(stream: TcpStream, from: SocketAddr, network: Shared, _slot:
         .insert(from, queue.clone())
         .is_some();
     if replaced {
-        network.relay.lock().unwrap().disconnect(client);
+        network
+            .relay
+            .lock()
+            .unwrap()
+            .disconnect(client, Instant::now());
     }
     let writing = tokio::spawn(async move {
         while let Some(message) = queued.recv().await {
@@ -217,7 +221,11 @@ async fn connection(stream: TcpStream, from: SocketAddr, network: Shared, _slot:
         ours
     };
     if still_ours {
-        network.relay.lock().unwrap().disconnect(client);
+        network
+            .relay
+            .lock()
+            .unwrap()
+            .disconnect(client, Instant::now());
     }
 }
 

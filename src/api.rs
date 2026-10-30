@@ -49,13 +49,19 @@ async fn open_room(State(api): State<Arc<Api>>) -> Response {
             ];
             (headers, body.to_string()).into_response()
         }
+        // When to ask again: a room can be opened every second, and rooms close within minutes
+        // of no longer being used.
         Err(RoomRefusal::TooSoon) => (
             StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "1")],
             "rooms are being opened too fast",
         )
             .into_response(),
-        Err(RoomRefusal::Full) => {
-            (StatusCode::SERVICE_UNAVAILABLE, "too many rooms are open").into_response()
-        }
+        Err(RoomRefusal::Full) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "60")],
+            "too many rooms are open",
+        )
+            .into_response(),
     }
 }

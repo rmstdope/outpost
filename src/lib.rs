@@ -53,17 +53,19 @@ impl Default for Config {
 }
 
 impl Config {
-    /// The defaults, with `OUTPOST_REVISION` and `OUTPOST_PUBLIC_IP` applied.
+    /// The defaults, with `OUTPOST_REVISION` and `OUTPOST_PUBLIC_IP` applied. The public IP
+    /// must be given: players are handed it, and a wrong one fails only in their browsers.
     pub fn from_env() -> Result<Self, String> {
         let mut config = Config::default();
         if let Ok(revision) = std::env::var("OUTPOST_REVISION") {
             config.revision = revision;
         }
-        if let Ok(ip) = std::env::var("OUTPOST_PUBLIC_IP") {
-            config.public_ip = ip
-                .parse()
-                .map_err(|_| format!("OUTPOST_PUBLIC_IP is not an IPv4 address: {ip}"))?;
-        }
+        let ip = std::env::var("OUTPOST_PUBLIC_IP").map_err(|_| {
+            "OUTPOST_PUBLIC_IP must be set to the IPv4 address players reach outpost at".to_string()
+        })?;
+        config.public_ip = ip
+            .parse()
+            .map_err(|_| format!("OUTPOST_PUBLIC_IP is not an IPv4 address: {ip}"))?;
         Ok(config)
     }
 }

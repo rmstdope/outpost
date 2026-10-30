@@ -22,13 +22,25 @@ async function page(browser, iceServer, policy) {
     await page.evaluate(
         ({ iceServer, policy }) => {
             window.pc = new RTCPeerConnection({ iceServers: [iceServer], iceTransportPolicy: policy });
+            // Gathering that does not finish in time fails the case rather than hanging the run.
             window.gathered = () =>
-                new Promise((resolve) => {
+                new Promise((resolve, reject) => {
                     if (pc.iceGatheringState === "complete") return resolve();
+                    const timer = setTimeout(() => reject(new Error("gathering did not finish in 15 s")), 15000);
                     pc.addEventListener("icegatheringstatechange", () => {
-                        if (pc.iceGatheringState === "complete") resolve();
+                        if (pc.iceGatheringState === "complete") {
+                            clearTimeout(timer);
+                            resolve();
+                        }
                     });
                 });
+            window.state = () => {
+                const types = pc.localDescription?.sdp
+                    .split("\n")
+                    .filter((line) => line.startsWith("a=candidate"))
+                    .map((line) => line.split(" ")[7]);
+                return `ice ${pc.iceConnectionState}, gathered ${types?.join(" ") || "nothing"}`;
+            };
             window.selectedPair = async () => {
                 const stats = [...(await pc.getStats()).values()];
                 const transport = stats.find((s) => s.type === "transport");
@@ -74,6 +86,9 @@ async function connect(browser, iceServer, hostPolicy, joinerPolicy) {
         );
         const pairs = reply === "pong" ? [await host.evaluate(() => selectedPair()), await joiner.evaluate(() => selectedPair())] : [];
         return { ok: reply === "pong" && pairs.every((pair) => pair === "relay<->relay"), pairs };
+    } catch (error) {
+        const states = [await host.evaluate(() => state()), await joiner.evaluate(() => state())];
+        return { ok: false, pairs: [`${error.message}; host ${states[0]}; joiner ${states[1]}`] };
     } finally {
         await host.context().close();
         await joiner.context().close();

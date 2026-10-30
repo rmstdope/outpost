@@ -14,7 +14,7 @@ is a bead filed after nr-z4nw and nr-ri8n.
 ```text
              wss://liaison.rmstdope.eu/ws                  (Caddy, 443)
 Browser A ─────────────── liaison ─────────────── Browser B
-                             │ internal: "credentials for room X"
+                             │ internal: "a room for this game"
                              ▼   (rmstdope-proxy network, never routed by Caddy)
                           outpost
 Browser A ── UDP 3478 ──►  outpost  ◄── UDP 3478 ── Browser B
@@ -22,9 +22,9 @@ Browser A ── UDP 3478 ──►  outpost  ◄── UDP 3478 ── Browser 
              https://outpost.rmstdope.eu/healthz, /release.json   (Caddy, 443)
 ```
 
-1. When a room is created or joined, liaison asks outpost, over the internal Docker network, for
-   TURN credentials tied to that room. It passes them to the browser with `created`/`joined`
-   as a ready-made `iceServers` entry.
+1. When a room is created, liaison asks outpost, over the internal Docker network, for a room of
+   its own. It passes the same ready-made `iceServers` entry to the host with `created` and to
+   the joiner with `joined`.
 2. Each browser allocates a relay address on outpost. WebRTC tries direct paths first and uses
    the relay only when they fail.
 3. outpost forwards traffic **only between the two allocations of the same room**, inside the
@@ -231,11 +231,19 @@ asks the container for a room's credentials on 8081 and opens a data channel thr
 Chrome and Firefox, over UDP and TCP.
 
 **Done (2026-10-30).** `POST /rooms` answers an `RTCIceServer` entry with a UDP and a TCP URL on
-`OUTPOST_PUBLIC_IP`, ready for liaison to pass on. Rooms last 12 hours; their login then stops
-working and the sweep ends their allocations. At most 10,000 are open (503 beyond), and they
-open at most one a second with bursts of 60 (429 beyond); liaison opens one per game.
-`browser/relay.mjs` runs in CI against the container, with 3478 published on the runner's
-own address since Firefox ignores loopback.
+`OUTPOST_PUBLIC_IP`, ready for liaison to pass on.
+- A room closes 20 minutes after its last allocation ends, or after it opened if none came
+  (longer than liaison waits for the second player), and after 12 hours whatever happens.
+  Its login then stops working and its allocations end. The review found that rooms held
+  their places for the full 12 hours otherwise, so anyone opening rooms could fill the 10,000
+  places and keep the relay full for hours.
+- At most 10,000 are open (503, retry after 60 s), and they open at most one a second with
+  bursts of 60 (429, retry after 1 s). The rate is checked first, so refused callers cannot
+  make outpost sweep at will.
+- `OUTPOST_PUBLIC_IP` must be set; outpost no longer starts handing out 127.0.0.1.
+- `browser/relay.mjs` runs in CI against the container, with 3478 published on the runner's
+  own address since Firefox ignores loopback. The container job runs on Ubuntu 24.04, where
+  Playwright 1.60 installs its browsers.
 
 ### 6. rmstdope-infra: the first app with a public non-HTTP port (infra PR)
 
@@ -283,9 +291,10 @@ needs no change there.
 
 ### 8. liaison hands out relay credentials (liaison)
 
-On `create` and `join`, liaison asks outpost for the room's credentials and adds
-`"iceServers": [...]` to `created` and `joined`. It updates the protocol in the README and keeps
-automatic updates.
+On `create`, liaison asks outpost for a room (`POST http://outpost-web:8081/rooms`), keeps the
+answer with its own room, and adds it as `"iceServers": [...]` to `created` and, unchanged, to
+`joined`. Both players must get the same entry: outpost relays only within one of its rooms.
+liaison updates the protocol in the README and keeps automatic updates.
 
 If outpost doesn't answer within a second, liaison leaves the relay out and the room still
 works; direct connections are unaffected. Tests use a fake outpost.

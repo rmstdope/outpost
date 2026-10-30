@@ -29,8 +29,9 @@ How it answers, over UDP and TCP alike:
 - a TURN request without a valid login is challenged with a 401 carrying the realm and a nonce.
   The nonce is tied to the client's address and transport and lasts an hour, then draws a 438;
 - a permission is for an IPv4 address and lasts five minutes unless renewed; a channel binding
-  lasts ten minutes and also installs a permission. An allocation holds at most 64 of each. Every relayed address shares `OUTPOST_PUBLIC_IP`, so the room rule is
-  applied when data is sent, not when permissions are given;
+  lasts ten minutes and also installs a permission. An allocation holds at most 64 of each.
+  Every relayed address shares `OUTPOST_PUBLIC_IP`, so the room rule is applied when data is
+  sent, not when permissions are given;
 - an allocation is UDP over IPv4 only. It lasts 10 minutes unless the client asks for longer
   (at most an hour), and it ends with a Refresh of lifetime 0, or when its TCP connection
   closes. Relayed ports are picked at random from 49152–65535. Nothing listens on them,
@@ -39,14 +40,14 @@ How it answers, over UDP and TCP alike:
 ## Running
 
 ```sh
-cargo run                      # HTTP on 0.0.0.0:8080, STUN/TURN on 0.0.0.0:3478 (UDP and TCP)
+OUTPOST_PUBLIC_IP=<your address> cargo run   # HTTP on 8080 and 8081, STUN/TURN on 3478
 cargo test                     # unit and end-to-end tests
 ```
 
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `OUTPOST_REVISION` | `unknown` | Source commit served from `/release.json`; the image sets it at build time. |
-| `OUTPOST_PUBLIC_IP` | `127.0.0.1` | The IPv4 address players reach port 3478 at. Relayed addresses are given on it, so production must set it; the startup log shows the one in use. |
+| `OUTPOST_PUBLIC_IP` | none: required | The IPv4 address players reach port 3478 at. `POST /rooms` hands it out and relayed addresses are given on it; outpost does not start without it. |
 
 ## Limits
 
@@ -56,7 +57,8 @@ Set in `src/limit.rs` (`Limits`); none can be changed without a new build.
 |---|---|---|
 | Rooms open at once | 10,000 | 503 from `POST /rooms` |
 | Rooms opened | 1 a second, bursts of 60 | 429 from `POST /rooms` |
-| A room's lifetime | 12 hours | its login stops working and its allocations end |
+| A room without allocations, since it opened or its last allocation ended | 20 minutes | it closes: its login stops working |
+| A room's lifetime | 12 hours | it closes, and its allocations end |
 | Allocations in a room | 8 | 486 |
 | Allocations from one IP address | 16 | 486 |
 | Allocations in all | 1000 | 508 |
@@ -110,17 +112,16 @@ On the internal port 8081:
 
 | Path | Answer |
 |---|---|
-| `POST /rooms` | A new room as an `RTCIceServer`, for both of its players: `{"urls":["turn:<ip>:3478?transport=udp","turn:<ip>:3478?transport=tcp"],"username":"…","credential":"…"}`, never cached. `429` when rooms are being opened too fast, `503` when too many are open. |
+| `POST /rooms` | A new room as an `RTCIceServer`, for both of its players: `{"urls":["turn:<ip>:3478?transport=udp","turn:<ip>:3478?transport=tcp"],"username":"…","credential":"…"}`, never cached. `429` with `Retry-After: 1` when rooms are being opened too fast, `503` with `Retry-After: 60` when too many are open. |
 
 ## Deployment
 
 CI (`.github/workflows/ci.yml`) checks formatting, runs clippy and every test, then builds the
 amd64 image, starts it with port 3478 published over UDP and TCP and probes it: health,
-`/release.json`, the non-root user, a Binding request over each transport
-(`cargo run --example smoke -- <address>:3478`), and a quick clean stop. In between,
-`browser/relay.mjs` has Chrome and Firefox open a WebRTC data channel through the container,
-over UDP and over TCP, with credentials from `POST /rooms`; every channel must go relay to
-relay. On `main` it then pushes
+`/release.json`, the non-root user, a Binding request over each transport (`cargo run --example
+smoke -- <address>:3478`), and a quick clean stop. In between, `browser/relay.mjs` has Chrome
+and Firefox open a WebRTC data channel through the container, over UDP and over TCP, with
+credentials from `POST /rooms`; every channel must go relay to relay. On `main` it then pushes
 that tested image to `ghcr.io/rmstdope/outpost` and uploads the `deployment-manifest` artifact
 that `rmstdope-infra` deploys.
 

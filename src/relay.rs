@@ -106,8 +106,17 @@ struct Room {
     allocations: usize,
     /// What is left of the bytes the room may relay (`Limits::room_bandwidth`).
     bandwidth: Bucket,
-    /// When its credentials stop working, and its allocations end.
-    expires: Instant,
+    /// When it ends whatever happens (`Limits::room_lifetime`).
+    ends: Instant,
+    /// Since when it has had no allocations (`Limits::room_idle`).
+    idle_since: Instant,
+}
+
+impl Room {
+    /// Whether its credentials still work. Once it is closed, its allocations end too.
+    fn is_open(&self, now: Instant, idle: Duration) -> bool {
+        now < self.ends && (self.allocations > 0 || now < self.idle_since + idle)
+    }
 }
 
 /// Why no room was opened.
@@ -217,14 +226,15 @@ impl Relay {
 
     /// Opens a room and returns the credentials both of its players log in with.
     pub fn open_room(&mut self, now: Instant) -> Result<Credentials, RoomRefusal> {
+        // The rate first, so that a caller refused for a full relay cannot have it swept at will.
+        if !self.opened.take(1.0, self.limits.rooms_opened, now) {
+            return Err(RoomRefusal::TooSoon);
+        }
         if self.rooms.len() >= self.limits.rooms {
             self.sweep(now);
             if self.rooms.len() >= self.limits.rooms {
                 return Err(RoomRefusal::Full);
             }
-        }
-        if !self.opened.take(1.0, self.limits.rooms_opened, now) {
-            return Err(RoomRefusal::TooSoon);
         }
         let credentials = Credentials {
             username: random_text(),
@@ -235,7 +245,8 @@ impl Relay {
             key,
             allocations: 0,
             bandwidth: Bucket::full(self.limits.room_bandwidth, self.epoch),
-            expires: now + self.limits.room_lifetime,
+            ends: now + self.limits.room_lifetime,
+            idle_since: now,
         };
         self.rooms.insert(credentials.username.clone(), room);
         Ok(credentials)
@@ -262,16 +273,26 @@ impl Relay {
     }
 
     /// Forgets the allocation of a client whose TCP connection has closed.
-    pub fn disconnect(&mut self, client: Client) {
-        self.remove(client);
+    pub fn disconnect(&mut self, client: Client, now: Instant) {
+        self.remove(client, now);
     }
 
-    /// Forgets allocations that have expired, and rooms that have ended with theirs.
+    /// Forgets allocations that have expired, and rooms that have closed with theirs.
     pub fn sweep(&mut self, now: Instant) {
+        self.sweep_allocations(now);
+        let idle = self.limits.room_idle;
+        self.rooms.retain(|_, room| room.is_open(now, idle));
+    }
+
+    /// Forgets allocations that have expired or whose room has closed, leaving the rooms be.
+    fn sweep_allocations(&mut self, now: Instant) {
+        let idle = self.limits.room_idle;
         let rooms = &self.rooms;
         let ended = |allocation: &Allocation| {
             allocation.expires <= now
-                || rooms.get(&allocation.room).is_none()
+                || rooms
+                    .get(&allocation.room)
+                    .is_none_or(|room| !room.is_open(now, idle))
         };
         let expired: Vec<Client> = self
             .allocations
@@ -280,9 +301,8 @@ impl Relay {
             .map(|(client, _)| *client)
             .collect();
         for client in expired {
-            self.remove(client);
+            self.remove(client, now);
         }
-        self.rooms.retain(|_, room| room.expires > now);
     }
 
     /// The long-term credential checks of RFC 8489 §9.2.4, in its order. Answers the room the
@@ -311,9 +331,9 @@ impl Relay {
             return Err(error(request, 400, "Bad Request"));
         };
         let room = std::str::from_utf8(username).ok().filter(|username| {
-            self.rooms
-                .get(*username)
-                .is_some_and(|room| room.expires > now && request.integrity_holds(&room.key))
+            self.rooms.get(*username).is_some_and(|room| {
+                room.is_open(now, self.limits.room_idle) && request.integrity_holds(&room.key)
+            })
         });
         let Some(room) = room else {
             return Err(challenge(401, "Unauthenticated"));
@@ -364,7 +384,7 @@ impl Relay {
             Some(_) => return error(request, 400, "Bad Request"),
         }
         // An expired allocation not yet swept must not hold a place in the room.
-        self.sweep(now);
+        self.sweep_allocations(now);
         let from_address = self
             .allocations
             .keys()
@@ -425,7 +445,7 @@ impl Relay {
         }
         let lifetime = desired_lifetime(request);
         if lifetime == 0 {
-            self.remove(client);
+            self.remove(client, now);
         } else {
             allocation.expires = now + Duration::from_secs(lifetime.into());
         }
@@ -548,7 +568,7 @@ impl Relay {
         let room = self
             .rooms
             .get_mut(&sender.room)
-            .filter(|room| room.expires > now)?;
+            .filter(|room| room.is_open(now, self.limits.room_idle))?;
         room.bandwidth
             .take(cost, self.limits.room_bandwidth, now)
             .then_some(Forward { to, from, channel })
@@ -577,16 +597,19 @@ impl Relay {
             .get(&client)
             .is_some_and(|allocation| allocation.expires <= now)
         {
-            self.remove(client);
+            self.remove(client, now);
         }
         self.allocations.get_mut(&client)
     }
 
-    fn remove(&mut self, client: Client) {
+    fn remove(&mut self, client: Client, now: Instant) {
         if let Some(allocation) = self.allocations.remove(&client) {
             self.ports.remove(&allocation.port);
             if let Some(room) = self.rooms.get_mut(&allocation.room) {
                 room.allocations -= 1;
+                if room.allocations == 0 {
+                    room.idle_since = now;
+                }
             }
         }
     }
@@ -1097,7 +1120,11 @@ mod tests {
 
     #[test]
     fn a_nonce_lasts_an_hour_for_its_own_client_only() {
-        let mut s = setup();
+        // A room left unused for longer than the nonce, so that only the nonce can expire.
+        let mut s = setup_with(Limits {
+            room_idle: Duration::from_secs(2 * NONCE_LIFETIME),
+            ..Limits::default()
+        });
         let room = s.room.clone();
         let nonce = s.nonce(client(1), s.start);
 
@@ -1318,7 +1345,8 @@ mod tests {
             Class::Success
         );
 
-        s.relay().disconnect(client(2));
+        let start = s.start;
+        s.relay().disconnect(client(2), start);
         assert_eq!(
             s.allocate(client(4), s.start).message().class(),
             Class::Success
@@ -2015,5 +2043,60 @@ mod tests {
             relay.open_room(at(start, 100)).is_ok(),
             "an ended room gives its place back"
         );
+    }
+
+    #[test]
+    fn a_room_nobody_allocates_in_closes_after_its_idle_time() {
+        let mut s = setup();
+        let idle = Limits::default().room_idle.as_secs();
+        let reply = s.allocate(client(1), at(s.start, idle - 1));
+        assert_eq!(reply.message().class(), Class::Success, "open until then");
+
+        s.room = s.open_room();
+        assert_eq!(s.allocate(client(2), at(s.start, idle)).code(), Some(401));
+        let start = s.start;
+        s.relay().sweep(at(start, idle));
+        assert_eq!(s.relay().rooms.len(), 1, "only the room in use is left");
+    }
+
+    #[test]
+    fn a_room_in_use_stays_open_and_closes_its_idle_time_after_its_last_allocation() {
+        let mut s = setup();
+        let idle = Limits::default().room_idle.as_secs();
+        s.allocate(client(1), s.start);
+        let mut seconds = 0;
+        while seconds < 2 * idle {
+            seconds += 500;
+            let kept = s.refresh(client(1), at(s.start, seconds), None);
+            assert_eq!(kept.message().class(), Class::Success, "at {seconds} s");
+        }
+        s.refresh(client(1), at(s.start, seconds), Some(0));
+        let (username, start) = (s.room.username.clone(), s.start);
+        let room = &s.relay().rooms[&username];
+        assert!(room.is_open(at(start, seconds + idle - 1), Duration::from_secs(idle)));
+        assert_eq!(
+            s.allocate(client(2), at(s.start, seconds + idle)).code(),
+            Some(401)
+        );
+    }
+
+    #[test]
+    fn opening_too_fast_is_refused_before_a_full_relay_is_swept() {
+        let start = Instant::now();
+        let mut relay = Relay::new(
+            PUBLIC_IP.into(),
+            Limits {
+                rooms: 1,
+                rooms_opened: crate::limit::Rate {
+                    per_second: 0.0,
+                    burst: 2.0,
+                },
+                ..Limits::default()
+            },
+            start,
+        );
+        assert!(relay.open_room(start).is_ok());
+        assert_eq!(relay.open_room(start).unwrap_err(), RoomRefusal::Full);
+        assert_eq!(relay.open_room(start).unwrap_err(), RoomRefusal::TooSoon);
     }
 }
