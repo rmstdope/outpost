@@ -230,6 +230,13 @@ CI then runs the step-1 Playwright test against the container (moved here from s
 asks the container for a room's credentials on 8081 and opens a data channel through it, in
 Chrome and Firefox, over UDP and TCP.
 
+**Done (2026-10-30).** `POST /rooms` answers an `RTCIceServer` entry with a UDP and a TCP URL on
+`OUTPOST_PUBLIC_IP`, ready for liaison to pass on. Rooms last 12 hours; their login then stops
+working and the sweep ends their allocations. At most 10,000 are open (503 beyond), and they
+open at most one a second with bursts of 60 (429 beyond); liaison opens one per game.
+`browser/relay.mjs` runs in CI against the container, with 3478 published on the runner's
+own address since Firefox ignores loopback.
+
 ### 6. rmstdope-infra: the first app with a public non-HTTP port (infra PR)
 
 - **Policy.** Allow a reviewed in-repo definition to publish named non-HTTP ports, listed

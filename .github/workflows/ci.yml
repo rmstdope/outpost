@@ -33,6 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: browser/package-lock.json
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
@@ -42,9 +47,14 @@ jobs:
           tags: ghcr.io/rmstdope/outpost:${{ github.sha }}
           build-args: REVISION=${{ github.sha }}
       - name: Start production container
+        # The TURN port is published on the runner's own address, since Firefox ignores
+        # loopback addresses; the internal API only on loopback.
         run: |
-          docker run -d --name outpost-test -p 127.0.0.1:18080:8080 \
-            -p 127.0.0.1:13478:3478/udp -p 127.0.0.1:13478:3478/tcp \
+          ip=$(hostname -I | awk '{print $1}')
+          echo "RUNNER_IP=$ip" >> "$GITHUB_ENV"
+          docker run -d --name outpost-test -e OUTPOST_PUBLIC_IP="$ip" \
+            -p 127.0.0.1:18080:8080 -p 127.0.0.1:18081:8081 \
+            -p "$ip:3478:3478/udp" -p "$ip:3478:3478/tcp" \
             ghcr.io/rmstdope/outpost:${{ github.sha }}
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:18080/healthz; then exit 0; fi
@@ -59,7 +69,15 @@ jobs:
           curl -fsS http://127.0.0.1:18080/release.json \
             | python3 -c 'import json,os,sys; assert json.load(sys.stdin) == {"revision": os.environ["REVISION"]}'
           test "$(docker exec outpost-test id -u)" = 10001
-          cargo run --locked --example smoke -- 127.0.0.1:13478
+          cargo run --locked --example smoke -- "$RUNNER_IP:3478"
+      - name: Install browsers
+        working-directory: browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium firefox
+      - name: Relay a data channel between two browsers
+        working-directory: browser
+        run: node relay.mjs http://127.0.0.1:18081/rooms
       - name: Stop container within the grace period
         run: |
           start=$(date +%s)

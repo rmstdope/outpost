@@ -19,6 +19,7 @@ const TRANSACTION: stun::Transaction = *b"outpost-test";
 
 struct Running {
     web: SocketAddr,
+    internal: SocketAddr,
     udp: SocketAddr,
     tcp: SocketAddr,
     room: Credentials,
@@ -33,6 +34,7 @@ async fn start_with(revision: &str, limits: Limits) -> Running {
     let outpost = Outpost::bind(Config {
         revision: revision.to_string(),
         web: loopback,
+        internal: loopback,
         turn: loopback,
         limits,
         ..Config::default()
@@ -41,9 +43,10 @@ async fn start_with(revision: &str, limits: Limits) -> Running {
     .unwrap();
     let running = Running {
         web: outpost.web_addr(),
+        internal: outpost.internal_addr(),
         udp: outpost.udp_addr(),
         tcp: outpost.tcp_addr(),
-        room: outpost.open_room(),
+        room: outpost.open_room().expect("a room"),
     };
     tokio::spawn(outpost.run(std::future::pending()));
     running
@@ -57,8 +60,14 @@ async fn within<T>(future: impl Future<Output = T>) -> T {
 
 /// A plain HTTP/1.1 GET, answered with the status, the raw headers and the body.
 async fn get(server: SocketAddr, path: &str) -> (u16, String, String) {
+    http(server, "GET", path).await
+}
+
+async fn http(server: SocketAddr, method: &str, path: &str) -> (u16, String, String) {
     let mut stream = TcpStream::connect(server).await.unwrap();
-    let request = format!("GET {path} HTTP/1.1\r\nHost: outpost\r\nConnection: close\r\n\r\n");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: outpost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = String::new();
     within(stream.read_to_string(&mut response)).await.unwrap();
@@ -806,4 +815,56 @@ async fn a_tcp_connection_that_does_not_allocate_in_time_is_closed() {
     );
     let binding = allocated.ask(&stun::binding_request(TRANSACTION)).await;
     assert_eq!(Message::parse(&binding).unwrap().class(), Class::Success);
+}
+
+#[tokio::test]
+async fn post_rooms_hands_out_an_ice_server_that_works() {
+    let outpost = start("test").await;
+    let (status, head, body) = http(outpost.internal, "POST", "/rooms").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(head.contains("content-type: application/json"), "{head}");
+    assert!(head.contains("cache-control: no-store"), "{head}");
+    let server: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        server["urls"],
+        serde_json::json!([
+            format!("turn:127.0.0.1:{}?transport=udp", outpost.udp.port()),
+            format!("turn:127.0.0.1:{}?transport=tcp", outpost.tcp.port()),
+        ])
+    );
+    let room = Credentials {
+        username: server["username"].as_str().unwrap().to_string(),
+        password: server["credential"].as_str().unwrap().to_string(),
+    };
+    let reply = Line::udp(outpost.udp).await.allocate(&room).await;
+    assert_eq!(Message::parse(&reply).unwrap().class(), Class::Success);
+
+    let (_, _, other) = http(outpost.internal, "POST", "/rooms").await;
+    assert_ne!(other, body, "every room is its own");
+}
+
+#[tokio::test]
+async fn rooms_are_opened_only_by_post_on_the_internal_port() {
+    let outpost = start("test").await;
+    assert_eq!(http(outpost.internal, "GET", "/rooms").await.0, 405);
+    assert_eq!(http(outpost.web, "POST", "/rooms").await.0, 404);
+    assert_eq!(http(outpost.internal, "GET", "/").await.0, 404);
+}
+
+#[tokio::test]
+async fn rooms_opened_too_fast_are_refused() {
+    let outpost = start_with(
+        "test",
+        Limits {
+            rooms_opened: Rate {
+                per_second: 0.0,
+                burst: 2.0,
+            },
+            ..Limits::default()
+        },
+    )
+    .await;
+    // `start` opened one already.
+    assert_eq!(http(outpost.internal, "POST", "/rooms").await.0, 200);
+    assert_eq!(http(outpost.internal, "POST", "/rooms").await.0, 429);
 }

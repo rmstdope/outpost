@@ -9,10 +9,11 @@ outpost is a STUN server (RFC 8489) and a TURN relay (RFC 8656) whose relaying n
 room:
 - a Binding request is answered with the address it came from, which tells a browser its public
   address;
-- Allocate and Refresh need a room's credentials (the long-term credential mechanism, realm
-  `outpost`). A room is one username and password, shared by its two players, and holds at
-  most eight allocations: a browser allocates once per TURN URL and network interface, and a
-  reloaded page leaves its old allocation behind until it expires;
+- Allocate and Refresh need a room's credentials, which `POST /rooms` on the internal port hands
+  out (the long-term credential mechanism, realm `outpost`). A room is one username and
+  password, shared by its two players, and holds at most eight allocations: a browser allocates
+  once per TURN URL and network interface, and a reloaded page leaves its old allocation behind
+  until it expires;
 - data sent with a Send indication or on a channel (ChannelBind and ChannelData) reaches
   another allocation of the same room, if each has a permission for the other. It arrives on
   the receiver's channel to the sender if it has bound one, padded to four bytes over TCP, and
@@ -53,6 +54,9 @@ Set in `src/limit.rs` (`Limits`); none can be changed without a new build.
 
 | Limit | Value | Beyond it |
 |---|---|---|
+| Rooms open at once | 10,000 | 503 from `POST /rooms` |
+| Rooms opened | 1 a second, bursts of 60 | 429 from `POST /rooms` |
+| A room's lifetime | 12 hours | its login stops working and its allocations end |
 | Allocations in a room | 8 | 486 |
 | Allocations from one IP address | 16 | 486 |
 | Allocations in all | 1000 | 508 |
@@ -91,6 +95,7 @@ Known limits of the limits:
 | Port | What |
 |---|---|
 | `8080/tcp` | HTTP, behind Caddy at `outpost.rmstdope.eu`. |
+| `8081/tcp` | The internal API. Never published or routed by Caddy: only containers on the same Docker network reach it. |
 | `3478/udp`, `3478/tcp` | STUN and TURN, published straight to the internet. A message may be at most 2048 bytes. Over TCP, messages follow each other with no other framing; anything that is not STUN, or is longer, closes the connection. |
 
 ## HTTP endpoints
@@ -101,12 +106,21 @@ Known limits of the limits:
 | `GET /healthz` | `200 ok` when the UDP port answers a Binding request within a second, `503` otherwise |
 | `GET /release.json` | `{"revision":"<commit>"}`, never cached |
 
+On the internal port 8081:
+
+| Path | Answer |
+|---|---|
+| `POST /rooms` | A new room as an `RTCIceServer`, for both of its players: `{"urls":["turn:<ip>:3478?transport=udp","turn:<ip>:3478?transport=tcp"],"username":"…","credential":"…"}`, never cached. `429` when rooms are being opened too fast, `503` when too many are open. |
+
 ## Deployment
 
 CI (`.github/workflows/ci.yml`) checks formatting, runs clippy and every test, then builds the
 amd64 image, starts it with port 3478 published over UDP and TCP and probes it: health,
 `/release.json`, the non-root user, a Binding request over each transport
-(`cargo run --example smoke -- 127.0.0.1:13478`) and a quick clean stop. On `main` it then pushes
+(`cargo run --example smoke -- <address>:3478`), and a quick clean stop. In between,
+`browser/relay.mjs` has Chrome and Firefox open a WebRTC data channel through the container,
+over UDP and over TCP, with credentials from `POST /rooms`; every channel must go relay to
+relay. On `main` it then pushes
 that tested image to `ghcr.io/rmstdope/outpost` and uploads the `deployment-manifest` artifact
 that `rmstdope-infra` deploys.
 

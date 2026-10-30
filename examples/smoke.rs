@@ -1,5 +1,5 @@
 //! Smoke test for a running outpost, used by CI against the production image:
-//! `cargo run --example smoke -- 127.0.0.1:13478`. A Binding request over UDP and over TCP each
+//! `cargo run --example smoke -- <address>:3478`. A Binding request over UDP and over TCP each
 //! gets an address back.
 
 use std::net::SocketAddr;

@@ -8,6 +8,13 @@ use std::time::{Duration, Instant};
 /// small VPS; tests make them smaller.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    /// Rooms open at once; one more gets 503 from `POST /rooms`.
+    pub rooms: usize,
+    /// How fast rooms may be opened; faster gets 429. A new room comes with a full
+    /// `room_bandwidth`, so this is what keeps that limit from being had again at will.
+    pub rooms_opened: Rate,
+    /// How long a room's credentials work. Its allocations end with it.
+    pub room_lifetime: Duration,
     /// Allocations in all; one beyond gets 508 (Insufficient Capacity).
     pub allocations: usize,
     /// Allocations from one IP address; one beyond gets 486 (Allocation Quota Reached). Room for
@@ -39,6 +46,12 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
+            rooms: 10_000,
+            rooms_opened: Rate {
+                per_second: 1.0,
+                burst: 60.0,
+            },
+            room_lifetime: Duration::from_secs(12 * 60 * 60),
             allocations: 1000,
             allocations_per_address: 16,
             room_bandwidth: Rate {
