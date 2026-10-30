@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
+use crate::limit::{Bucket, Limits};
 use crate::stun::attribute::{
     CHANNEL_NUMBER, DATA, DONT_FRAGMENT, LIFETIME, MESSAGE_INTEGRITY, NONCE, REALM,
     REQUESTED_ADDRESS_FAMILY, REQUESTED_TRANSPORT, SOFTWARE, UNKNOWN_ATTRIBUTES, USERNAME,
@@ -37,6 +38,10 @@ const MAX_PERMISSIONS: usize = 64;
 const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
 /// Channels one allocation may bind. A browser binds one per address of the other player.
 const MAX_CHANNELS: usize = 64;
+/// What a relayed message costs besides its data, at most: the header and attributes of a Data
+/// indication, and the padding of its data. Charged on every message, so that empty ones are
+/// not free.
+const MESSAGE_COST: usize = 40;
 /// Allocations per room. A browser allocates once per TURN URL and network interface (UDP and
 /// TCP, Wi-Fi and a VPN), and a reloaded page leaves its old allocation behind until it expires.
 /// Two players need room for all of that; relaying stays within the room whatever the number.
@@ -83,6 +88,10 @@ pub struct Client {
 pub struct Outgoing {
     pub to: Client,
     pub message: Vec<u8>,
+    /// An answer to a request that did not log in. Its source address may have been forged,
+    /// so over UDP it counts against `Limits::udp_answers`. One that logged in carries a nonce
+    /// tied to the address it came from, which no one else can produce.
+    pub forgeable: bool,
 }
 
 /// What both players of a room use to log in.
@@ -95,6 +104,8 @@ pub struct Credentials {
 struct Room {
     key: [u8; 16],
     allocations: usize,
+    /// What is left of the bytes the room may relay (`Limits::room_bandwidth`).
+    bandwidth: Bucket,
 }
 
 struct Allocation {
@@ -174,12 +185,14 @@ pub struct Relay {
     ports: HashMap<u16, Client>,
     nonce_secret: [u8; 20],
     epoch: Instant,
+    limits: Limits,
 }
 
 impl Relay {
-    pub fn new(public_ip: Ipv4Addr, now: Instant) -> Self {
+    pub fn new(public_ip: Ipv4Addr, limits: Limits, now: Instant) -> Self {
         Relay {
             public_ip,
+            limits,
             rooms: HashMap::new(),
             allocations: HashMap::new(),
             ports: HashMap::new(),
@@ -198,6 +211,7 @@ impl Relay {
         let room = Room {
             key,
             allocations: 0,
+            bandwidth: Bucket::full(self.limits.room_bandwidth, self.epoch),
         };
         self.rooms.insert(credentials.username.clone(), room);
         credentials
@@ -217,6 +231,10 @@ impl Relay {
                 (self.authenticated(request, client, &room, now), Some(key))
             }
         }
+    }
+
+    pub fn has_allocation(&self, client: Client) -> bool {
+        self.allocations.contains_key(&client)
     }
 
     /// Forgets the allocation of a client whose TCP connection has closed.
@@ -317,8 +335,18 @@ impl Relay {
         }
         // An expired allocation not yet swept must not hold a place in the room.
         self.sweep(now);
-        if self.rooms[room].allocations >= ROOM_SIZE {
+        let from_address = self
+            .allocations
+            .keys()
+            .filter(|other| other.address.ip() == client.address.ip())
+            .count();
+        if self.rooms[room].allocations >= ROOM_SIZE
+            || from_address >= self.limits.allocations_per_address
+        {
             return error(request, 486, "Allocation Quota Reached");
+        }
+        if self.allocations.len() >= self.limits.allocations {
+            return error(request, 508, "Insufficient Capacity");
         }
         let Some(port) = self.free_port() else {
             return error(request, 508, "Insufficient Capacity");
@@ -454,8 +482,14 @@ impl Relay {
     /// Where data from `client` to `peer` goes: RFC 8656 §11.2 and §12.6, with the room rule
     /// (PLAN.md D1). The peer must be another live allocation of the sender's room, the sender
     /// must have a permission for the peer, and the peer one for the sender. Anything else is
-    /// dropped silently.
-    fn forward(&self, client: Client, peer: SocketAddr, now: Instant) -> Option<Forward> {
+    /// dropped silently, as is data beyond the room's bandwidth (`Limits::room_bandwidth`).
+    fn forward(
+        &mut self,
+        client: Client,
+        peer: SocketAddr,
+        bytes: usize,
+        now: Instant,
+    ) -> Option<Forward> {
         let public_ip = IpAddr::from(self.public_ip);
         if peer.ip() != public_ip {
             return None;
@@ -475,20 +509,28 @@ impl Relay {
             return None;
         }
         let from = SocketAddr::new(public_ip, sender.port);
-        Some(Forward {
-            to,
-            from,
-            channel: receiver.channel_to(from, now),
-        })
+        let channel = receiver.channel_to(from, now);
+        let cost = (bytes + MESSAGE_COST) as f64;
+        let room = self.rooms.get_mut(&sender.room)?;
+        room.bandwidth
+            .take(cost, self.limits.room_bandwidth, now)
+            .then_some(Forward { to, from, channel })
     }
 
     /// Where data on the sender's channel `number` goes, if it is bound.
-    fn forward_channel(&self, client: Client, number: u16, now: Instant) -> Option<Forward> {
-        let sender = self
+    fn forward_channel(
+        &mut self,
+        client: Client,
+        number: u16,
+        bytes: usize,
+        now: Instant,
+    ) -> Option<Forward> {
+        let peer = self
             .allocations
             .get(&client)
-            .filter(|allocation| allocation.expires > now)?;
-        self.forward(client, sender.channel(number, now)?, now)
+            .filter(|allocation| allocation.expires > now)?
+            .channel(number, now)?;
+        self.forward(client, peer, bytes, now)
     }
 
     /// The client's allocation, if it has one that has not expired.
@@ -584,6 +626,7 @@ pub fn handle(
     Some(Outgoing {
         to: client,
         message,
+        forgeable: key.is_none(),
     })
 }
 
@@ -600,7 +643,10 @@ fn send(
     }
     let peer = indication.xor_address(XOR_PEER_ADDRESS)?;
     let data = indication.attribute(DATA)?;
-    let forward = relay.lock().unwrap().forward(client, peer, now)?;
+    let forward = relay
+        .lock()
+        .unwrap()
+        .forward(client, peer, data.len(), now)?;
     Some(relayed(forward, data))
 }
 
@@ -612,7 +658,10 @@ fn channel_data(
     now: Instant,
 ) -> Option<Outgoing> {
     let (number, data) = stun::parse_channel_data(bytes)?;
-    let forward = relay.lock().unwrap().forward_channel(client, number, now)?;
+    let forward = relay
+        .lock()
+        .unwrap()
+        .forward_channel(client, number, data.len(), now)?;
     Some(relayed(forward, data))
 }
 
@@ -629,6 +678,7 @@ fn relayed(forward: Forward, data: &[u8]) -> Outgoing {
     Outgoing {
         to: forward.to,
         message,
+        forgeable: false,
     }
 }
 
@@ -711,8 +761,12 @@ mod tests {
     }
 
     fn setup() -> Setup {
+        setup_with(Limits::default())
+    }
+
+    fn setup_with(limits: Limits) -> Setup {
         let start = Instant::now();
-        let mut relay = Relay::new(PUBLIC_IP.into(), start);
+        let mut relay = Relay::new(PUBLIC_IP.into(), limits, start);
         let room = relay.open_room();
         Setup {
             relay: Mutex::new(relay),
@@ -1717,5 +1771,143 @@ mod tests {
         let later = at(s.start, CHANNEL_LIFETIME.as_secs());
         let reply = s.bind(client(1), later, 0x4fff, peer(999));
         assert_eq!(reply.message().class(), Class::Success);
+    }
+
+    fn from_address(ip: [u8; 4], port: u16) -> Client {
+        Client {
+            address: SocketAddr::from((ip, port)),
+            transport: Transport::Udp,
+        }
+    }
+
+    #[test]
+    fn one_address_holds_a_bounded_number_of_allocations() {
+        let mut s = setup_with(Limits {
+            allocations_per_address: 3,
+            ..Limits::default()
+        });
+        for port in 1..=3 {
+            s.allocate(client(port), s.start);
+        }
+        assert_eq!(s.allocate(client(4), s.start).code(), Some(486));
+        let elsewhere = s.allocate(from_address([192, 0, 2, 7], 4), s.start);
+        assert_eq!(elsewhere.message().class(), Class::Success);
+        s.refresh(client(1), s.start, Some(0));
+        assert_eq!(
+            s.allocate(client(4), s.start).message().class(),
+            Class::Success
+        );
+    }
+
+    #[test]
+    fn outpost_holds_a_bounded_number_of_allocations() {
+        let mut s = setup_with(Limits {
+            allocations: 3,
+            ..Limits::default()
+        });
+        for n in 1..=3 {
+            s.allocate(from_address([192, 0, 2, n], 1), s.start);
+        }
+        assert_eq!(
+            s.allocate(from_address([192, 0, 2, 4], 1), s.start).code(),
+            Some(508)
+        );
+        s.refresh(from_address([192, 0, 2, 1], 1), s.start, Some(0));
+        let reply = s.allocate(from_address([192, 0, 2, 4], 1), s.start);
+        assert_eq!(reply.message().class(), Class::Success);
+    }
+
+    fn with_room_bandwidth(per_second: f64, burst: f64) -> Setup {
+        setup_with(Limits {
+            room_bandwidth: crate::limit::Rate { per_second, burst },
+            ..Limits::default()
+        })
+    }
+
+    fn on_channel_with(s: &Setup, client: Client, seconds: u64, bytes: usize) -> bool {
+        let message = stun::channel_data(0x4000, &vec![0; bytes], false);
+        handle(&s.relay, &message, client, at(s.start, seconds)).is_some()
+    }
+
+    #[test]
+    fn a_room_relays_at_most_its_bandwidth_shared_by_its_players() {
+        let mut s = with_room_bandwidth(100.0, 1000.0);
+        let [(first, first_relayed), (second, second_relayed)] = two_players(&mut s);
+        s.bind(first, s.start, 0x4000, second_relayed);
+        s.bind(second, s.start, 0x4000, first_relayed);
+        let cost = |bytes: usize| bytes + MESSAGE_COST;
+        assert!(on_channel_with(&s, first, 0, 600));
+        assert!(!on_channel_with(&s, first, 0, 600), "beyond the burst");
+        assert!(on_channel_with(
+            &s,
+            first,
+            0,
+            1000 - cost(600) - MESSAGE_COST
+        ));
+        assert!(
+            !on_channel_with(&s, first, 0, 0),
+            "nothing is left, not even for nothing"
+        );
+        assert!(
+            !on_channel_with(&s, second, 0, 0),
+            "the other player shares it"
+        );
+        assert!(
+            on_channel_with(&s, second, 7, 600),
+            "seven seconds at 100 bytes a second"
+        );
+    }
+
+    #[test]
+    fn every_relayed_message_costs_something_even_when_empty() {
+        let mut s = with_room_bandwidth(0.0, 10.0 * MESSAGE_COST as f64);
+        let [(first, _), (_, second_relayed)] = two_players(&mut s);
+        s.bind(first, s.start, 0x4000, second_relayed);
+        for _ in 0..10 {
+            assert!(on_channel_with(&s, first, 0, 0));
+        }
+        assert!(!on_channel_with(&s, first, 0, 0));
+    }
+
+    #[test]
+    fn allocating_again_does_not_refill_the_rooms_bandwidth() {
+        let mut s = with_room_bandwidth(0.0, 1000.0);
+        let [(first, _), (second, second_relayed)] = two_players(&mut s);
+        s.bind(first, s.start, 0x4000, second_relayed);
+        assert!(on_channel_with(&s, first, 0, 1000 - MESSAGE_COST - 10));
+
+        s.refresh(first, s.start, Some(0));
+        let again = Client {
+            transport: Transport::Tcp,
+            ..first
+        };
+        let again_relayed = s.allocate(again, s.start).relayed();
+        s.permit(again, s.start, &[second_relayed]);
+        s.permit(second, s.start, &[again_relayed]);
+        s.bind(again, s.start, 0x4000, second_relayed);
+        assert!(!on_channel_with(&s, again, 0, 0));
+    }
+
+    #[test]
+    fn only_answers_that_did_not_log_in_could_be_going_to_a_forged_source() {
+        let mut s = setup();
+        let forgeable = |s: &mut Setup, request: Vec<u8>| {
+            handle(&s.relay, &request, client(1), s.start)
+                .unwrap()
+                .forgeable
+        };
+        assert!(forgeable(&mut s, stun::binding_request(*b"binding-test")));
+        assert!(forgeable(&mut s, unsigned(ALLOCATE, *b"challenge-me")));
+        let nonce = s.nonce(client(1), s.start);
+        let room = s.room.clone();
+        let signed_allocate = signed(ALLOCATE, &room, &nonce, *b"allocate-it!", udp);
+        assert!(!forgeable(&mut s, signed_allocate));
+
+        let [(first, _), (_, second_relayed)] = two_players(&mut s);
+        let data = s.send(first, s.start, second_relayed).unwrap();
+        assert!(
+            !data.forgeable,
+            "relayed data goes to an allocation's own address"
+        );
     }
 }

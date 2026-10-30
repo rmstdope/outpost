@@ -2,6 +2,7 @@
 //! room. PLAN.md describes where it is going; so far it is a STUN server that also hands out
 //! TURN allocations.
 
+mod limit;
 mod relay;
 pub mod stun;
 mod turn;
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, UdpSocket};
 
+pub use limit::{Limits, Rate};
 pub use relay::Credentials;
 pub use web::app;
 
@@ -30,6 +32,7 @@ pub struct Config {
     /// The IPv4 address players reach the TURN port at, given as the address of their relayed
     /// connections.
     pub public_ip: Ipv4Addr,
+    pub limits: Limits,
 }
 
 impl Default for Config {
@@ -40,6 +43,7 @@ impl Default for Config {
             turn: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 3478)),
             probe_timeout: Duration::from_secs(1),
             public_ip: Ipv4Addr::LOCALHOST,
+            limits: Limits::default(),
         }
     }
 }
@@ -72,10 +76,10 @@ pub struct Outpost {
 
 impl Outpost {
     pub async fn bind(config: Config) -> io::Result<Outpost> {
-        let relay = relay::Relay::new(config.public_ip, Instant::now());
+        let relay = relay::Relay::new(config.public_ip, config.limits, Instant::now());
         Ok(Outpost {
             web: TcpListener::bind(config.web).await?,
-            network: turn::Network::new(relay, UdpSocket::bind(config.turn).await?),
+            network: turn::Network::new(relay, UdpSocket::bind(config.turn).await?, config.limits),
             tcp: TcpListener::bind(config.turn).await?,
             revision: config.revision,
             probe_timeout: config.probe_timeout,

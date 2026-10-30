@@ -126,7 +126,8 @@ Delivered in four pull requests:
 - **4a.** Allocate and Refresh with long-term authentication, a quota per room, and lifetimes.
 - **4b.** CreatePermission, and Send and Data indications, within a room only.
 - **4c.** ChannelBind and ChannelData, over UDP and TCP.
-- **4d.** The limits below, and the Playwright test run in CI against the container.
+- **4d.** The limits below. The Playwright test in CI moves to step 5, which first lets a
+  test ask outpost for a room's credentials.
 
 **4a done (2026-10-30).** Chrome and Firefox allocate over UDP and TCP; a wrong password draws a
 401. Decisions on the way:
@@ -171,6 +172,32 @@ local outpost in every run. Decisions on the way:
 - Over TCP the first four bytes tell ChannelData from STUN; ChannelData is padded to four
   bytes there and not over UDP.
 
+**4d done (2026-10-30).** The limits are in `src/limit.rs` and listed in the README, with
+these defaults:
+- 16 allocations per IP address and 1000 in all;
+- 512 KiB/s per room with bursts of 2 MiB, each message counted as its data plus 40 bytes;
+- 16 TCP connections per address and 1000 in all. A connection is closed after 120 s without a
+  whole message, or 30 s without an allocation;
+- 20 UDP answers a second per address, with bursts of 40, to requests that did not log in.
+
+Data beyond the bandwidth is dropped, as if lost on the way, and WebRTC's congestion control
+slows down. Chrome and Firefox still connected in every run with these defaults.
+
+The review of 4d found ways around a first version, which shaped the limits:
+- **Bandwidth is per room, not per allocation.** Ending an allocation and making a new one
+  refilled a per-allocation bucket, and one player could hold several allocations.
+- **Every relayed message costs its data plus 40 bytes,** so empty messages are not free.
+- **Answers to requests that logged in are not limited.** Their nonce cannot be forged for
+  another address, so forged floods cannot cut a player off from their allocation.
+- **The answers are counted in a fixed table of buckets** picked by a keyed hash of the
+  address, rather than one bucket per address seen. A first version tracked up to 100,000
+  addresses with a shared overflow, which forged sources could fill and drain.
+- **A TCP connection that has not allocated within 30 s is closed.** That bounds how long one
+  connection without credentials holds a place, but a client reconnecting from many
+  addresses can still keep them taken; the README lists this.
+
+Total bandwidth is not capped; step 7 checks Hostup's link and monthly allowance against it.
+
 - Allocations with long-term credential authentication (realm, nonce).
 - Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData.
 - The same requests over TCP 3478, with RFC 8656's framing (D3).
@@ -178,7 +205,7 @@ local outpost in every run. Decisions on the way:
 - Limits:
   - eight allocations per room (4a);
   - allocations per client address;
-  - TCP connections per client address, and idle TCP connections closed;
+  - TCP connections per client address and in all, and idle TCP connections closed;
   - answers per client address over UDP: a spoofed 20-byte Binding request draws a reply about
     three times its size, so outpost must not be a useful reflector;
   - a bandwidth cap per allocation, with room for bursts;
@@ -192,9 +219,16 @@ Logs show only counts, no addresses. Tests:
 
 ### 5. Credentials API (outpost)
 
-A second HTTP listener on 8081, with `POST /rooms` only. It returns `{urls, username, credential}` for one room, valid for
-12 hours, and the credentials work only within that room. Port 8081 is never published or
-routed by Caddy.
+A second HTTP listener on 8081, with `POST /rooms` only. It returns
+`{urls, username, credential}` for one room, valid for 12 hours, and the credentials work only
+within that room. Port 8081 is never published or routed by Caddy.
+
+Rooms are opened at a limited rate (a new room gets a fresh allowance of bandwidth, so the
+room limits in 4d hold only if rooms cannot be had at will).
+
+CI then runs the step-1 Playwright test against the container (moved here from step 4): it
+asks the container for a room's credentials on 8081 and opens a data channel through it, in
+Chrome and Firefox, over UDP and TCP.
 
 ### 6. rmstdope-infra: the first app with a public non-HTTP port (infra PR)
 
