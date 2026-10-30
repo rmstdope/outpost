@@ -51,7 +51,7 @@ cargo test                     # unit and end-to-end tests
 | Port | What |
 |---|---|
 | `8080/tcp` | HTTP, behind Caddy at `outpost.rmstdope.eu`. |
-| `3478/udp`, `3478/tcp` | STUN and TURN, published straight to the internet. Over TCP, messages follow each other with no other framing; anything that is not STUN closes the connection. |
+| `3478/udp`, `3478/tcp` | STUN and TURN, published straight to the internet. A message may be at most 2048 bytes. Over TCP, messages follow each other with no other framing; anything that is not STUN, or is longer, closes the connection. |
 
 ## HTTP endpoints
 

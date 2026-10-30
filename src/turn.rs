@@ -16,6 +16,10 @@ use tokio::sync::mpsc;
 use crate::relay::{self, Client, Outgoing, Relay, Transport};
 use crate::stun::{self, HEADER_LEN};
 
+/// The longest message outpost takes, over either transport: more than any browser sends, and
+/// it keeps what a TCP client's queue can hold small.
+const MAX_MESSAGE: usize = 2048;
+
 /// Messages waiting to be written to one TCP client. A client that falls this far behind loses
 /// what does not fit, as it would over UDP.
 const TCP_QUEUE: usize = 256;
@@ -65,8 +69,8 @@ impl Network {
 }
 
 pub async fn serve_udp(network: Shared) -> io::Result<()> {
-    // Larger than any datagram a browser sends; a longer one is cut short and then refused.
-    let mut datagram = [0; 2048];
+    // A longer datagram is cut short, and then refused.
+    let mut datagram = [0; MAX_MESSAGE];
     loop {
         let (size, from) = match network.udp.recv_from(&mut datagram).await {
             Ok(received) => received,
@@ -101,6 +105,10 @@ pub async fn serve_tcp(listener: TcpListener, network: Shared) -> io::Result<()>
 
 /// One TCP client: its messages are read here, and everything for it is written by a task of
 /// its own, in the order it was queued. When the connection ends, so does its allocation.
+///
+/// Clients are told apart by address, and a new connection can arrive from an address whose
+/// old connection has not been cleaned up yet. The new one takes the address over, ending the
+/// old one's allocation, and the old one cleans up only what is still its own.
 async fn connection(stream: TcpStream, from: SocketAddr, network: Shared) {
     let client = Client {
         address: from,
@@ -108,7 +116,15 @@ async fn connection(stream: TcpStream, from: SocketAddr, network: Shared) {
     };
     let (mut reader, mut writer) = stream.into_split();
     let (queue, mut queued) = mpsc::channel::<Vec<u8>>(TCP_QUEUE);
-    network.tcp.lock().unwrap().insert(from, queue);
+    let replaced = network
+        .tcp
+        .lock()
+        .unwrap()
+        .insert(from, queue.clone())
+        .is_some();
+    if replaced {
+        network.relay.lock().unwrap().disconnect(client);
+    }
     let writing = tokio::spawn(async move {
         while let Some(message) = queued.recv().await {
             if writer.write_all(&message).await.is_err() {
@@ -117,19 +133,31 @@ async fn connection(stream: TcpStream, from: SocketAddr, network: Shared) {
         }
     });
     let _ = messages(&mut reader, client, &network).await;
-    network.tcp.lock().unwrap().remove(&from);
-    network.relay.lock().unwrap().disconnect(client);
     writing.abort();
+    let still_ours = {
+        let mut tcp = network.tcp.lock().unwrap();
+        let ours = tcp
+            .get(&from)
+            .is_some_and(|entry| entry.same_channel(&queue));
+        if ours {
+            tcp.remove(&from);
+        }
+        ours
+    };
+    if still_ours {
+        network.relay.lock().unwrap().disconnect(client);
+    }
 }
 
 /// Over TCP, STUN messages follow each other with no other framing (RFC 8489 §6.2.2). Anything
-/// that is not a STUN message ends the connection.
+/// that is not a STUN message, or is longer than `MAX_MESSAGE`, ends the connection.
 async fn messages(reader: &mut OwnedReadHalf, client: Client, network: &Network) -> io::Result<()> {
     let mut message = vec![0; HEADER_LEN];
     loop {
         message.resize(HEADER_LEN, 0);
         reader.read_exact(&mut message).await?;
-        let Some(length) = stun::message_length(&message) else {
+        let Some(length) = stun::message_length(&message).filter(|length| *length <= MAX_MESSAGE)
+        else {
             return Ok(());
         };
         message.resize(length, 0);

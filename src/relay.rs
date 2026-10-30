@@ -333,12 +333,18 @@ impl Relay {
             return error(request, 443, "Peer Address Family Mismatch");
         }
         allocation.permissions.retain(|_, expires| *expires > now);
+        let mut new: Vec<IpAddr> = peers
+            .iter()
+            .map(SocketAddr::ip)
+            .filter(|ip| !allocation.permissions.contains_key(ip))
+            .collect();
+        new.sort_unstable();
+        new.dedup();
+        // All or nothing (RFC 8656 §10.2): a request that does not fit installs none of them.
+        if allocation.permissions.len() + new.len() > MAX_PERMISSIONS {
+            return error(request, 508, "Insufficient Capacity");
+        }
         for peer in peers {
-            if allocation.permissions.len() >= MAX_PERMISSIONS
-                && !allocation.permissions.contains_key(&peer.ip())
-            {
-                return error(request, 508, "Insufficient Capacity");
-            }
             allocation
                 .permissions
                 .insert(peer.ip(), now + PERMISSION_LIFETIME);
@@ -348,14 +354,15 @@ impl Relay {
 
     /// RFC 8656 §11.2, with the room rule (PLAN.md D1): the peer must be another live
     /// allocation of the sender's room, the sender must have a permission for the peer, and the
-    /// peer one for the sender. Anything else is dropped silently. The peer gets a Data
-    /// indication from the sender's relayed address.
-    fn send(&self, indication: &Message, client: Client, now: Instant) -> Option<Outgoing> {
-        if unknown_attributes(indication).is_some() {
-            return None;
-        }
+    /// peer one for the sender. Anything else is dropped silently. Answers the peer's client and
+    /// the sender's relayed address, which the Data indication comes from.
+    fn send(
+        &self,
+        indication: &Message,
+        client: Client,
+        now: Instant,
+    ) -> Option<(Client, SocketAddr)> {
         let peer = indication.xor_address(XOR_PEER_ADDRESS)?;
-        let data = indication.attribute(DATA)?;
         let public_ip = IpAddr::from(self.public_ip);
         if peer.ip() != public_ip {
             return None;
@@ -374,11 +381,7 @@ impl Relay {
         {
             return None;
         }
-        let message = Builder::new(stun::DATA, Class::Indication, rand::random())
-            .xor_address(XOR_PEER_ADDRESS, SocketAddr::new(public_ip, sender.port))
-            .attribute(DATA, data)
-            .build();
-        Some(Outgoing { to, message })
+        Some((to, SocketAddr::new(public_ip, sender.port)))
     }
 
     /// The client's allocation, if it has one that has not expired.
@@ -464,7 +467,7 @@ pub fn handle(
         (Class::Request, ALLOCATE | REFRESH | CREATE_PERMISSION) => {
             relay.lock().unwrap().turn(&message, client, now)
         }
-        (Class::Indication, SEND) => return relay.lock().unwrap().send(&message, client, now),
+        (Class::Indication, SEND) => return data_indication(relay, &message, client, now),
         _ => return None,
     };
     let message = finish(response, key.as_ref().map(|key| &key[..]));
@@ -472,6 +475,26 @@ pub fn handle(
         to: client,
         message,
     })
+}
+
+/// The Data indication a Send indication becomes, if the relay lets it through. The checks
+/// that need no state come first, and the message is built after the lock is let go.
+fn data_indication(
+    relay: &Mutex<Relay>,
+    indication: &Message,
+    client: Client,
+    now: Instant,
+) -> Option<Outgoing> {
+    if unknown_attributes(indication).is_some() {
+        return None;
+    }
+    let data = indication.attribute(DATA)?;
+    let (to, from) = relay.lock().unwrap().send(indication, client, now)?;
+    let message = Builder::new(stun::DATA, Class::Indication, rand::random())
+        .xor_address(XOR_PEER_ADDRESS, from)
+        .attribute(DATA, data)
+        .build();
+    Some(Outgoing { to, message })
 }
 
 /// A Binding request needs no credentials.
@@ -1174,9 +1197,10 @@ mod tests {
     #[test]
     fn data_goes_nowhere_but_to_another_allocation_of_the_same_room() {
         let mut s = setup();
-        let [(first, first_relayed), _] = two_players(&mut s);
+        let [(first, first_relayed), (_, second_relayed)] = two_players(&mut s);
         let foreign: SocketAddr = "203.0.113.50:1234".parse().unwrap();
-        let same_port_elsewhere = SocketAddr::new([10, 0, 0, 1].into(), first_relayed.port());
+        // The second player's port on another address, so only the address can refuse it.
+        let same_port_elsewhere = SocketAddr::new([10, 0, 0, 1].into(), second_relayed.port());
         let unallocated = SocketAddr::new(first_relayed.ip(), 1023);
         s.permit(first, s.start, &[foreign, same_port_elsewhere]);
 
@@ -1258,21 +1282,31 @@ mod tests {
     fn an_allocation_holds_a_bounded_number_of_permissions() {
         let mut s = setup();
         s.allocate(client(1), s.start);
-        let peers: Vec<SocketAddr> = (0..MAX_PERMISSIONS as u32)
-            .map(|n| SocketAddr::from((Ipv4Addr::from(0x0a00_0000 + n), 1)))
-            .collect();
+        let peer = |n: u32| SocketAddr::from((Ipv4Addr::from(0x0a00_0000 + n), 1));
+        let peers: Vec<SocketAddr> = (0..MAX_PERMISSIONS as u32 - 1).map(peer).collect();
         assert_eq!(
             s.permit(client(1), s.start, &peers).message().class(),
             Class::Success
         );
-        let one_more: SocketAddr = "203.0.113.50:1".parse().unwrap();
-        assert_eq!(s.permit(client(1), s.start, &[one_more]).code(), Some(508));
+
+        // One place left: a request for two new peers gets neither.
+        let two_new = [peer(1000), peer(1001)];
+        assert_eq!(s.permit(client(1), s.start, &two_new).code(), Some(508));
+        let last = s.permit(client(1), s.start, &[peer(1002)]);
+        assert_eq!(
+            last.message().class(),
+            Class::Success,
+            "the place is still free"
+        );
+        assert_eq!(
+            s.permit(client(1), s.start, &[peer(1003)]).code(),
+            Some(508)
+        );
+
         let renewal = s.permit(client(1), s.start, &peers[..1]);
         assert_eq!(renewal.message().class(), Class::Success);
         let later = at(s.start, PERMISSION_LIFETIME.as_secs());
-        assert_eq!(
-            s.permit(client(1), later, &[one_more]).message().class(),
-            Class::Success
-        );
+        let after_expiry = s.permit(client(1), later, &[peer(1003)]);
+        assert_eq!(after_expiry.message().class(), Class::Success);
     }
 }

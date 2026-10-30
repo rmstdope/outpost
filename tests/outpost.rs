@@ -12,7 +12,7 @@ use outpost::stun::{
 };
 use outpost::{Config, Credentials, Outpost};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 
 const TRANSACTION: stun::Transaction = *b"outpost-test";
 
@@ -387,4 +387,88 @@ async fn carries(
     );
     assert_eq!(arrived.xor_address(XOR_PEER_ADDRESS), Some(from_relayed));
     assert_eq!(arrived.attribute(DATA), Some(data));
+}
+
+#[tokio::test]
+async fn game_data_crosses_between_two_tcp_players() {
+    let outpost = start("test").await;
+    let mut first = Line::tcp(outpost.tcp).await;
+    let mut second = Line::tcp(outpost.tcp).await;
+    let first_relayed = first.relayed(&outpost.room).await;
+    let second_relayed = second.relayed(&outpost.room).await;
+    first.permit(&outpost.room, second_relayed).await;
+    second.permit(&outpost.room, first_relayed).await;
+    carries(
+        &mut first,
+        first_relayed,
+        &mut second,
+        second_relayed,
+        b"one",
+    )
+    .await;
+    carries(
+        &mut second,
+        second_relayed,
+        &mut first,
+        first_relayed,
+        b"two",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn tcp_closes_a_connection_that_sends_a_message_longer_than_a_datagram() {
+    let outpost = start("test").await;
+    let mut client = TcpStream::connect(outpost.tcp).await.unwrap();
+    let long = Builder::new(BINDING, Class::Request, TRANSACTION)
+        .attribute(0x8050, &[0; 4096])
+        .build();
+    client.write_all(&long).await.unwrap();
+    let mut rest = vec![];
+    match within(client.read_to_end(&mut rest)).await {
+        Ok(_) => assert!(rest.is_empty(), "answered {} bytes", rest.len()),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+    }
+}
+
+/// Connects from `port` (any, if 0), so a new connection can reuse an old one's address.
+/// Answers the line and the port it is on.
+async fn connect_from(port: u16, server: SocketAddr) -> (Line, u16) {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_reuseaddr(true).unwrap();
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, 1], port)))
+        .unwrap();
+    let port = socket.local_addr().unwrap().port();
+    (Line::Tcp(socket.connect(server).await.unwrap()), port)
+}
+
+/// Ends a connection with a reset rather than a close, so its address is free again at once.
+#[allow(deprecated)] // A zero linger does not block on drop, which is what the warning is about.
+fn reset(line: Line) {
+    let Line::Tcp(stream) = line else {
+        unreachable!()
+    };
+    stream.set_linger(Some(Duration::ZERO)).unwrap();
+}
+
+#[tokio::test]
+async fn a_new_connection_from_a_reused_address_is_served_whatever_the_old_one_does() {
+    let outpost = start("test").await;
+    let mut port = 0;
+    for _ in 0..5 {
+        let (mut old, bound) = connect_from(port, outpost.tcp).await;
+        port = bound;
+        old.relayed(&outpost.room).await;
+        reset(old);
+
+        let (mut new, _) = connect_from(port, outpost.tcp).await;
+        let reply = new.allocate(&outpost.room).await;
+        assert_eq!(Message::parse(&reply).unwrap().class(), Class::Success);
+        // Give the old connection's end time to run, then check the new one still hears.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let binding = new.ask(&stun::binding_request(TRANSACTION)).await;
+        assert_eq!(Message::parse(&binding).unwrap().class(), Class::Success);
+        reset(new);
+    }
 }

@@ -153,7 +153,12 @@ path (23–81 ms after the answer). Decisions on the way:
 - CreatePermission is granted for any IPv4 address, as in the spike, because on its own it lets
   nothing through. An allocation holds at most 64 permissions (508 beyond).
 - Answers and data for a TCP client go through a queue of 256 messages per connection. A client
-  that falls further behind loses what does not fit, as it would over UDP.
+  that falls further behind loses what does not fit, as it would over UDP. Messages over TCP
+  are capped at 2048 bytes, like datagrams, so one connection's queue holds at most about
+  0.5 MB.
+- TCP clients are told apart by address. A new connection from an address whose old one is
+  still being cleaned up takes the address over and ends the old allocation, and the old
+  connection then cleans up only what is still its own.
 
 - Allocations with long-term credential authentication (realm, nonce).
 - Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData.
