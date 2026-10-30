@@ -13,7 +13,7 @@ use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
-use crate::limit::{Limiter, Limits};
+use crate::limit::{HashedBuckets, Limits};
 use crate::relay::{self, Client, Outgoing, Relay, Transport};
 use crate::stun::{self, CHANNEL_DATA_HEADER_LEN, HEADER_LEN};
 
@@ -31,7 +31,7 @@ pub struct Network {
     pub udp: UdpSocket,
     tcp: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
     tcp_slots: Mutex<Slots>,
-    udp_answers: Mutex<Limiter<IpAddr>>,
+    udp_answers: Mutex<HashedBuckets>,
     limits: Limits,
 }
 
@@ -51,10 +51,10 @@ impl Network {
             udp,
             tcp: Mutex::default(),
             tcp_slots: Mutex::default(),
-            udp_answers: Mutex::new(Limiter::new(
+            udp_answers: Mutex::new(HashedBuckets::new(
                 limits.udp_answers,
-                limits.udp_answer_addresses,
-                limits.udp_answers_overflow,
+                limits.udp_answer_buckets,
+                Instant::now(),
             )),
             limits,
         })
@@ -226,9 +226,13 @@ async fn connection(stream: TcpStream, from: SocketAddr, network: Shared, _slot:
 /// `Limits::tcp_setup` after it opened.
 async fn messages(reader: &mut OwnedReadHalf, client: Client, network: &Network) -> io::Result<()> {
     let opened = Instant::now();
+    let mut allocated = false;
     let mut message = Vec::with_capacity(MAX_MESSAGE);
     loop {
-        let wait = if network.relay.lock().unwrap().has_allocation(client) {
+        // Once allocated, the idle timeout is enough: an allocation that ends early leaves the
+        // connection as any other client's, silent or not.
+        allocated = allocated || network.relay.lock().unwrap().has_allocation(client);
+        let wait = if allocated {
             network.limits.tcp_idle
         } else {
             let left = network.limits.tcp_setup.saturating_sub(opened.elapsed());
@@ -270,14 +274,11 @@ async fn read(reader: &mut OwnedReadHalf, message: &mut Vec<u8>) -> io::Result<b
     Ok(true)
 }
 
-/// Forgets expired allocations, and addresses whose UDP answers have refilled, every so often.
-/// Until then expired allocations are only unreachable.
+/// Forgets expired allocations every so often; until then they are only unreachable.
 pub async fn sweep(network: Shared) -> io::Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     loop {
         interval.tick().await;
-        let now = Instant::now();
-        network.relay.lock().unwrap().sweep(now);
-        network.udp_answers.lock().unwrap().sweep(now);
+        network.relay.lock().unwrap().sweep(Instant::now());
     }
 }

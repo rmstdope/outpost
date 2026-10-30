@@ -583,10 +583,18 @@ async fn answers(stream: &mut TcpStream) -> bool {
     {
         return false;
     }
-    let mut header = [0; stun::HEADER_LEN];
+    // The whole answer is read, so that nothing is left over to be mistaken for the next one.
+    let whole_answer = async {
+        let mut answer = vec![0; stun::HEADER_LEN];
+        stream.read_exact(&mut answer).await?;
+        let length = stun::message_length(&answer).ok_or(std::io::ErrorKind::InvalidData)?;
+        answer.resize(length, 0);
+        stream.read_exact(&mut answer[stun::HEADER_LEN..]).await?;
+        std::io::Result::Ok(())
+    };
     matches!(
-        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut header)).await,
-        Ok(Ok(_))
+        tokio::time::timeout(Duration::from_secs(2), whole_answer).await,
+        Ok(Ok(()))
     )
 }
 

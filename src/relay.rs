@@ -39,8 +39,9 @@ const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
 /// Channels one allocation may bind. A browser binds one per address of the other player.
 const MAX_CHANNELS: usize = 64;
 /// What a relayed message costs besides its data, at most: the header and attributes of a Data
-/// indication. Charged on every message, so that empty ones are not free.
-const MESSAGE_COST: usize = 36;
+/// indication, and the padding of its data. Charged on every message, so that empty ones are
+/// not free.
+const MESSAGE_COST: usize = 40;
 /// Allocations per room. A browser allocates once per TURN URL and network interface (UDP and
 /// TCP, Wi-Fi and a VPN), and a reloaded page leaves its old allocation behind until it expires.
 /// Two players need room for all of that; relaying stays within the room whatever the number.
@@ -481,7 +482,7 @@ impl Relay {
     /// Where data from `client` to `peer` goes: RFC 8656 §11.2 and §12.6, with the room rule
     /// (PLAN.md D1). The peer must be another live allocation of the sender's room, the sender
     /// must have a permission for the peer, and the peer one for the sender. Anything else is
-    /// dropped silently, as is data beyond the sender's bandwidth (`Limits::bandwidth`).
+    /// dropped silently, as is data beyond the room's bandwidth (`Limits::room_bandwidth`).
     fn forward(
         &mut self,
         client: Client,

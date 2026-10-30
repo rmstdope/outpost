@@ -175,7 +175,7 @@ local outpost in every run. Decisions on the way:
 **4d done (2026-10-30).** The limits are in `src/limit.rs` and listed in the README, with
 these defaults:
 - 16 allocations per IP address and 1000 in all;
-- 512 KiB/s per room with bursts of 2 MiB, each message counted as its data plus 36 bytes;
+- 512 KiB/s per room with bursts of 2 MiB, each message counted as its data plus 40 bytes;
 - 16 TCP connections per address and 1000 in all. A connection is closed after 120 s without a
   whole message, or 30 s without an allocation;
 - 20 UDP answers a second per address, with bursts of 40, to requests that did not log in.
@@ -186,13 +186,15 @@ slows down. Chrome and Firefox still connected in every run with these defaults.
 The review of 4d found ways around a first version, which shaped the limits:
 - **Bandwidth is per room, not per allocation.** Ending an allocation and making a new one
   refilled a per-allocation bucket, and one player could hold several allocations.
-- **Every relayed message costs its data plus 36 bytes,** so empty messages are not free.
+- **Every relayed message costs its data plus 40 bytes,** so empty messages are not free.
 - **Answers to requests that logged in are not limited.** Their nonce cannot be forged for
-  another address, so forged floods cannot cut a player off from their allocation. When too
-  many addresses are tracked, new ones share an overflow allowance rather than getting
-  nothing.
-- **A TCP connection that has not allocated within 30 s is closed,** so connections without
-  credentials cannot hold the places.
+  another address, so forged floods cannot cut a player off from their allocation.
+- **The answers are counted in a fixed table of buckets** picked by a keyed hash of the
+  address, rather than one bucket per address seen. A first version tracked up to 100,000
+  addresses with a shared overflow, which forged sources could fill and drain.
+- **A TCP connection that has not allocated within 30 s is closed.** That bounds how long one
+  connection without credentials holds a place, but a client reconnecting from many
+  addresses can still keep them taken; the README lists this.
 
 Total bandwidth is not capped; step 7 checks Hostup's link and monthly allowance against it.
 
@@ -220,6 +222,9 @@ Logs show only counts, no addresses. Tests:
 A second HTTP listener on 8081, with `POST /rooms` only. It returns
 `{urls, username, credential}` for one room, valid for 12 hours, and the credentials work only
 within that room. Port 8081 is never published or routed by Caddy.
+
+Rooms are opened at a limited rate (a new room gets a fresh allowance of bandwidth, so the
+room limits in 4d hold only if rooms cannot be had at will).
 
 CI then runs the step-1 Playwright test against the container (moved here from step 4): it
 asks the container for a room's credentials on 8081 and opens a data channel through it, in

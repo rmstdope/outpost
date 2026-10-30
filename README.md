@@ -57,12 +57,11 @@ Set in `src/limit.rs` (`Limits`); none can be changed without a new build.
 | Allocations from one IP address | 16 | 486 |
 | Allocations in all | 1000 | 508 |
 | Permissions, and channels, per allocation | 64 each | 508 |
-| Bytes one room relays, both players together, each message counted as its data plus 36 bytes | 512 KiB/s, bursts of 2 MiB | dropped |
+| Bytes one room relays, both players together, each message counted as its data plus 40 bytes | 512 KiB/s, bursts of 2 MiB | dropped |
 | TCP connections from one IP address, and in all | 16, and 1000 | closed at once |
 | A TCP connection sending no whole message | 120 s | closed |
 | A TCP connection without an allocation, from when it opened | 30 s | closed |
 | Answers over UDP to one IP address, to requests that did not log in | 20 a second, bursts of 40 | dropped |
-| IP addresses those answers are tracked for | 100,000; beyond that, new ones share 1000 a second | dropped |
 | A message, over UDP or TCP | 2048 bytes | dropped, or the TCP connection closed |
 
 A game sends a few kilobytes a second, so the bandwidth leaves room for a ROM to cross in
@@ -71,11 +70,17 @@ seconds. It is kept per room, so allocating again does not refill it.
 The UDP answer limit is there because a UDP source can be forged: without it, outpost could be
 used to flood someone else with its answers. Answers to requests that logged in are not
 counted, since their nonce is tied to the address they came from and nobody else can produce
-one. So a flood of forged requests cannot cut a player off from their own allocation.
+one. So a flood of forged requests cannot cut a player off from their own allocation. The
+answers are counted in a fixed table of 65,536 buckets, picked by a keyed hash of the address:
+an address never gets more than its bucket allows, and the table cannot be filled up.
 
 Known limits of the limits:
 - Behind carrier-grade NAT (mobile networks, campuses), unrelated players share one IP
   address and its per-address limits.
+- A TCP connection without credentials is closed after 30 s, but a client that keeps
+  reconnecting from many addresses can still keep the TCP places taken.
+- ChannelData is not authenticated (as in all of TURN over UDP). Someone who knows a player's
+  address, port and channel number can send in their name and use up their room's bandwidth.
 - Nothing caps the total bandwidth: 1000 allocations could ask for more than the VPS's link.
   The link and its monthly transfer allowance are the real ceiling.
 - The per-address limits are for IPv4, which is all outpost listens on. Listening on IPv6
