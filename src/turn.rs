@@ -54,6 +54,7 @@ impl Network {
             udp_answers: Mutex::new(Limiter::new(
                 limits.udp_answers,
                 limits.udp_answer_addresses,
+                limits.udp_answers_overflow,
             )),
             limits,
         })
@@ -65,8 +66,8 @@ impl Network {
             return;
         };
         // An answer over UDP may be going to a forged source (`Limits::udp_answers`).
-        let answer_over_udp = outgoing.to == client && client.transport == Transport::Udp;
-        if answer_over_udp
+        if outgoing.forgeable
+            && outgoing.to.transport == Transport::Udp
             && !self
                 .udp_answers
                 .lock()
@@ -221,11 +222,22 @@ async fn connection(stream: TcpStream, from: SocketAddr, network: Shared, _slot:
 }
 
 /// Reads and handles messages until the connection ends, sends something that is not a
-/// message, or stays silent for `Limits::tcp_idle`.
+/// message, sends no whole message for `Limits::tcp_idle`, or has no allocation
+/// `Limits::tcp_setup` after it opened.
 async fn messages(reader: &mut OwnedReadHalf, client: Client, network: &Network) -> io::Result<()> {
+    let opened = Instant::now();
     let mut message = Vec::with_capacity(MAX_MESSAGE);
     loop {
-        match tokio::time::timeout(network.limits.tcp_idle, read(reader, &mut message)).await {
+        let wait = if network.relay.lock().unwrap().has_allocation(client) {
+            network.limits.tcp_idle
+        } else {
+            let left = network.limits.tcp_setup.saturating_sub(opened.elapsed());
+            if left.is_zero() {
+                return Ok(());
+            }
+            left.min(network.limits.tcp_idle)
+        };
+        match tokio::time::timeout(wait, read(reader, &mut message)).await {
             Ok(Ok(true)) => network.receive(&message, client).await,
             Ok(Ok(false)) | Err(_) => return Ok(()),
             Ok(Err(error)) => return Err(error),

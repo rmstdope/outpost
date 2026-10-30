@@ -646,3 +646,156 @@ async fn a_silent_tcp_connection_is_closed() {
         Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
     }
 }
+
+#[tokio::test]
+async fn udp_answers_are_limited_per_ip_address_whatever_the_port() {
+    let outpost = start_with(
+        "test",
+        Limits {
+            udp_answers: Rate {
+                per_second: 0.0,
+                burst: 4.0,
+            },
+            ..Limits::default()
+        },
+    )
+    .await;
+    let mut answers = 0;
+    for _ in 0..4 {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..2 {
+            client
+                .send_to(&stun::binding_request(TRANSACTION), outpost.udp)
+                .await
+                .unwrap();
+        }
+        let mut datagram = [0; 512];
+        while tokio::time::timeout(Duration::from_millis(200), client.recv(&mut datagram))
+            .await
+            .is_ok()
+        {
+            answers += 1;
+        }
+    }
+    assert_eq!(answers, 4);
+}
+
+#[tokio::test]
+async fn answers_to_requests_that_logged_in_are_not_limited() {
+    let outpost = start_with(
+        "test",
+        Limits {
+            udp_answers: Rate {
+                per_second: 0.0,
+                burst: 1.0,
+            },
+            ..Limits::default()
+        },
+    )
+    .await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ask = |request: Vec<u8>| {
+        let socket = &socket;
+        async move {
+            socket.send_to(&request, outpost.udp).await.unwrap();
+            let mut datagram = vec![0; 2048];
+            let answer =
+                tokio::time::timeout(Duration::from_millis(300), socket.recv(&mut datagram)).await;
+            answer.ok().map(|size| datagram[..size.unwrap()].to_vec())
+        }
+    };
+    let unsigned = || {
+        Builder::new(ALLOCATE, Class::Request, *b"first-try!!!")
+            .attribute(REQUESTED_TRANSPORT, &[17, 0, 0, 0])
+            .build()
+    };
+    // The one unlimited answer goes to the challenge.
+    let challenge = ask(unsigned()).await.expect("the challenge");
+    let nonce = Message::parse(&challenge)
+        .unwrap()
+        .attribute(NONCE)
+        .unwrap()
+        .to_vec();
+    let room = &outpost.room;
+    let key = long_term_key(&room.username, "outpost", &room.password);
+    let signed = |builder: Builder| {
+        builder
+            .attribute(USERNAME, room.username.as_bytes())
+            .attribute(REALM, b"outpost")
+            .attribute(NONCE, &nonce)
+            .integrity(&key)
+            .fingerprint()
+    };
+    let allocate = signed(
+        Builder::new(ALLOCATE, Class::Request, *b"second-try!!")
+            .attribute(REQUESTED_TRANSPORT, &[17, 0, 0, 0]),
+    );
+    let allocated = ask(allocate).await.expect("an answer to a signed request");
+    let relayed = Message::parse(&allocated)
+        .unwrap()
+        .xor_address(XOR_RELAYED_ADDRESS)
+        .unwrap();
+    for _ in 0..3 {
+        let permit = signed(
+            Builder::new(CREATE_PERMISSION, Class::Request, *b"permit-them!")
+                .xor_address(XOR_PEER_ADDRESS, relayed),
+        );
+        let reply = ask(permit).await.expect("an answer to a signed request");
+        assert_eq!(Message::parse(&reply).unwrap().class(), Class::Success);
+    }
+    assert!(
+        ask(unsigned()).await.is_none(),
+        "an unsigned one is over the limit"
+    );
+}
+
+#[tokio::test]
+async fn a_tcp_message_sent_slower_than_the_idle_time_closes_the_connection() {
+    let outpost = start_with(
+        "test",
+        Limits {
+            tcp_idle: Duration::from_millis(300),
+            ..Limits::default()
+        },
+    )
+    .await;
+    let mut client = TcpStream::connect(outpost.tcp).await.unwrap();
+    // One byte every 100 ms: never silent for long, but the message takes two seconds.
+    for byte in stun::binding_request(TRANSACTION) {
+        if client.write_all(&[byte]).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut rest = vec![];
+    match within(client.read_to_end(&mut rest)).await {
+        Ok(_) => assert!(rest.is_empty(), "answered"),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+    }
+}
+
+#[tokio::test]
+async fn a_tcp_connection_that_does_not_allocate_in_time_is_closed() {
+    let outpost = start_with(
+        "test",
+        Limits {
+            tcp_setup: Duration::from_millis(400),
+            ..Limits::default()
+        },
+    )
+    .await;
+    let mut idle = TcpStream::connect(outpost.tcp).await.unwrap();
+    let mut allocated = Line::tcp(outpost.tcp).await;
+    allocated.relayed(&outpost.room).await;
+    // Talking is not enough: without an allocation the connection ends all the same.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = answers(&mut idle).await;
+    }
+    assert!(
+        !answers(&mut idle).await,
+        "still open without an allocation"
+    );
+    let binding = allocated.ask(&stun::binding_request(TRANSACTION)).await;
+    assert_eq!(Message::parse(&binding).unwrap().class(), Class::Success);
+}

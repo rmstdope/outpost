@@ -38,6 +38,9 @@ const MAX_PERMISSIONS: usize = 64;
 const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
 /// Channels one allocation may bind. A browser binds one per address of the other player.
 const MAX_CHANNELS: usize = 64;
+/// What a relayed message costs besides its data, at most: the header and attributes of a Data
+/// indication. Charged on every message, so that empty ones are not free.
+const MESSAGE_COST: usize = 36;
 /// Allocations per room. A browser allocates once per TURN URL and network interface (UDP and
 /// TCP, Wi-Fi and a VPN), and a reloaded page leaves its old allocation behind until it expires.
 /// Two players need room for all of that; relaying stays within the room whatever the number.
@@ -84,6 +87,10 @@ pub struct Client {
 pub struct Outgoing {
     pub to: Client,
     pub message: Vec<u8>,
+    /// An answer to a request that did not log in. Its source address may have been forged,
+    /// so over UDP it counts against `Limits::udp_answers`. One that logged in carries a nonce
+    /// tied to the address it came from, which no one else can produce.
+    pub forgeable: bool,
 }
 
 /// What both players of a room use to log in.
@@ -96,6 +103,8 @@ pub struct Credentials {
 struct Room {
     key: [u8; 16],
     allocations: usize,
+    /// What is left of the bytes the room may relay (`Limits::room_bandwidth`).
+    bandwidth: Bucket,
 }
 
 struct Allocation {
@@ -108,8 +117,6 @@ struct Allocation {
     permissions: HashMap<IpAddr, Instant>,
     /// The channels bound by number (RFC 8656 §12).
     channels: HashMap<u16, Channel>,
-    /// What is left of the data this allocation may relay (`Limits::bandwidth`).
-    bandwidth: Bucket,
 }
 
 struct Channel {
@@ -203,6 +210,7 @@ impl Relay {
         let room = Room {
             key,
             allocations: 0,
+            bandwidth: Bucket::full(self.limits.room_bandwidth, self.epoch),
         };
         self.rooms.insert(credentials.username.clone(), room);
         credentials
@@ -222,6 +230,10 @@ impl Relay {
                 (self.authenticated(request, client, &room, now), Some(key))
             }
         }
+    }
+
+    pub fn has_allocation(&self, client: Client) -> bool {
+        self.allocations.contains_key(&client)
     }
 
     /// Forgets the allocation of a client whose TCP connection has closed.
@@ -346,7 +358,6 @@ impl Relay {
             expires: now + Duration::from_secs(lifetime.into()),
             permissions: HashMap::new(),
             channels: HashMap::new(),
-            bandwidth: Bucket::full(self.limits.bandwidth, now),
         };
         self.allocations.insert(client, allocation);
         self.ports.insert(port, client);
@@ -498,11 +509,10 @@ impl Relay {
         }
         let from = SocketAddr::new(public_ip, sender.port);
         let channel = receiver.channel_to(from, now);
-        let rate = self.limits.bandwidth;
-        let sender = self.allocations.get_mut(&client)?;
-        sender
-            .bandwidth
-            .take(bytes as f64, rate, now)
+        let cost = (bytes + MESSAGE_COST) as f64;
+        let room = self.rooms.get_mut(&sender.room)?;
+        room.bandwidth
+            .take(cost, self.limits.room_bandwidth, now)
             .then_some(Forward { to, from, channel })
     }
 
@@ -615,6 +625,7 @@ pub fn handle(
     Some(Outgoing {
         to: client,
         message,
+        forgeable: key.is_none(),
     })
 }
 
@@ -666,6 +677,7 @@ fn relayed(forward: Forward, data: &[u8]) -> Outgoing {
     Outgoing {
         to: forward.to,
         message,
+        forgeable: false,
     }
 }
 
@@ -1804,31 +1816,97 @@ mod tests {
         assert_eq!(reply.message().class(), Class::Success);
     }
 
-    #[test]
-    fn an_allocation_relays_at_most_its_bandwidth() {
-        let mut s = setup_with(Limits {
-            bandwidth: crate::limit::Rate {
-                per_second: 100.0,
-                burst: 1000.0,
-            },
+    fn with_room_bandwidth(per_second: f64, burst: f64) -> Setup {
+        setup_with(Limits {
+            room_bandwidth: crate::limit::Rate { per_second, burst },
             ..Limits::default()
-        });
+        })
+    }
+
+    fn on_channel_with(s: &Setup, client: Client, seconds: u64, bytes: usize) -> bool {
+        let message = stun::channel_data(0x4000, &vec![0; bytes], false);
+        handle(&s.relay, &message, client, at(s.start, seconds)).is_some()
+    }
+
+    #[test]
+    fn a_room_relays_at_most_its_bandwidth_shared_by_its_players() {
+        let mut s = with_room_bandwidth(100.0, 1000.0);
+        let [(first, first_relayed), (second, second_relayed)] = two_players(&mut s);
+        s.bind(first, s.start, 0x4000, second_relayed);
+        s.bind(second, s.start, 0x4000, first_relayed);
+        let cost = |bytes: usize| bytes + MESSAGE_COST;
+        assert!(on_channel_with(&s, first, 0, 600));
+        assert!(!on_channel_with(&s, first, 0, 600), "beyond the burst");
+        assert!(on_channel_with(
+            &s,
+            first,
+            0,
+            1000 - cost(600) - MESSAGE_COST
+        ));
+        assert!(
+            !on_channel_with(&s, first, 0, 0),
+            "nothing is left, not even for nothing"
+        );
+        assert!(
+            !on_channel_with(&s, second, 0, 0),
+            "the other player shares it"
+        );
+        assert!(
+            on_channel_with(&s, second, 7, 600),
+            "seven seconds at 100 bytes a second"
+        );
+    }
+
+    #[test]
+    fn every_relayed_message_costs_something_even_when_empty() {
+        let mut s = with_room_bandwidth(0.0, 10.0 * MESSAGE_COST as f64);
+        let [(first, _), (_, second_relayed)] = two_players(&mut s);
+        s.bind(first, s.start, 0x4000, second_relayed);
+        for _ in 0..10 {
+            assert!(on_channel_with(&s, first, 0, 0));
+        }
+        assert!(!on_channel_with(&s, first, 0, 0));
+    }
+
+    #[test]
+    fn allocating_again_does_not_refill_the_rooms_bandwidth() {
+        let mut s = with_room_bandwidth(0.0, 1000.0);
         let [(first, _), (second, second_relayed)] = two_players(&mut s);
         s.bind(first, s.start, 0x4000, second_relayed);
-        let data = |bytes: usize| stun::channel_data(0x4000, &vec![0; bytes], false);
-        let relayed = |s: &Setup, seconds: u64, bytes: usize| {
-            handle(&s.relay, &data(bytes), first, at(s.start, seconds)).is_some()
+        assert!(on_channel_with(&s, first, 0, 1000 - MESSAGE_COST - 10));
+
+        s.refresh(first, s.start, Some(0));
+        let again = Client {
+            transport: Transport::Tcp,
+            ..first
         };
-        assert!(relayed(&s, 0, 600));
-        assert!(!relayed(&s, 0, 600), "beyond the burst");
-        assert!(relayed(&s, 0, 400), "what is left of it");
+        let again_relayed = s.allocate(again, s.start).relayed();
+        s.permit(again, s.start, &[second_relayed]);
+        s.permit(second, s.start, &[again_relayed]);
+        s.bind(again, s.start, 0x4000, second_relayed);
+        assert!(!on_channel_with(&s, again, 0, 0));
+    }
+
+    #[test]
+    fn only_answers_that_did_not_log_in_could_be_going_to_a_forged_source() {
+        let mut s = setup();
+        let forgeable = |s: &mut Setup, request: Vec<u8>| {
+            handle(&s.relay, &request, client(1), s.start)
+                .unwrap()
+                .forgeable
+        };
+        assert!(forgeable(&mut s, stun::binding_request(*b"binding-test")));
+        assert!(forgeable(&mut s, unsigned(ALLOCATE, *b"challenge-me")));
+        let nonce = s.nonce(client(1), s.start);
+        let room = s.room.clone();
+        let signed_allocate = signed(ALLOCATE, &room, &nonce, *b"allocate-it!", udp);
+        assert!(!forgeable(&mut s, signed_allocate));
+
+        let [(first, _), (_, second_relayed)] = two_players(&mut s);
+        let data = s.send(first, s.start, second_relayed).unwrap();
         assert!(
-            !relayed(&s, 0, 1),
-            "dropped data costs nothing, and nothing is left"
+            !data.forgeable,
+            "relayed data goes to an allocation's own address"
         );
-        assert!(relayed(&s, 6, 600), "six seconds at 100 bytes a second");
-        // The other player's allowance is its own.
-        let first_relayed = s.allocate(first, s.start).relayed();
-        assert!(s.send(second, s.start, first_relayed).is_some());
     }
 }

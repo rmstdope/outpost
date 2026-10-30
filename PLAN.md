@@ -175,12 +175,26 @@ local outpost in every run. Decisions on the way:
 **4d done (2026-10-30).** The limits are in `src/limit.rs` and listed in the README, with
 these defaults:
 - 16 allocations per IP address and 1000 in all;
-- 256 KiB/s per allocation with bursts of 1 MiB;
-- 16 TCP connections per address and 1000 in all, closed after 120 s of silence;
-- 20 UDP answers a second per address, with bursts of 40.
+- 512 KiB/s per room with bursts of 2 MiB, each message counted as its data plus 36 bytes;
+- 16 TCP connections per address and 1000 in all. A connection is closed after 120 s without a
+  whole message, or 30 s without an allocation;
+- 20 UDP answers a second per address, with bursts of 40, to requests that did not log in.
 
 Data beyond the bandwidth is dropped, as if lost on the way, and WebRTC's congestion control
 slows down. Chrome and Firefox still connected in every run with these defaults.
+
+The review of 4d found ways around a first version, which shaped the limits:
+- **Bandwidth is per room, not per allocation.** Ending an allocation and making a new one
+  refilled a per-allocation bucket, and one player could hold several allocations.
+- **Every relayed message costs its data plus 36 bytes,** so empty messages are not free.
+- **Answers to requests that logged in are not limited.** Their nonce cannot be forged for
+  another address, so forged floods cannot cut a player off from their allocation. When too
+  many addresses are tracked, new ones share an overflow allowance rather than getting
+  nothing.
+- **A TCP connection that has not allocated within 30 s is closed,** so connections without
+  credentials cannot hold the places.
+
+Total bandwidth is not capped; step 7 checks Hostup's link and monthly allowance against it.
 
 - Allocations with long-term credential authentication (realm, nonce).
 - Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData.
