@@ -143,6 +143,18 @@ Delivered in four pull requests:
   as browsers do.
 - Rooms do not expire yet; step 5 gives them their 12 hours.
 
+**4b done (2026-10-30).** With a local outpost, Chrome and Firefox opened a data channel
+relay↔relay over UDP and over TCP, both with both pages relay-only and with one free to use any
+path (23–81 ms after the answer). Decisions on the way:
+- Every relayed address shares `OUTPOST_PUBLIC_IP`, and permissions are by IP address only
+  (RFC 8656 §9). A permission cannot tell rooms apart, so the room rule is applied when data is
+  sent, as §11.2 allows: the peer must be another live allocation of the sender's room, and
+  each must have a permission for the other.
+- CreatePermission is granted for any IPv4 address, as in the spike, because on its own it lets
+  nothing through. An allocation holds at most 64 permissions (508 beyond).
+- Answers and data for a TCP client go through a queue of 256 messages per connection. A client
+  that falls further behind loses what does not fit, as it would over UDP.
+
 - Allocations with long-term credential authentication (realm, nonce).
 - Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData.
 - The same requests over TCP 3478, with RFC 8656's framing (D3).

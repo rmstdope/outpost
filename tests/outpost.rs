@@ -4,9 +4,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use outpost::stun::attribute::{
-    ERROR_CODE, NONCE, REALM, REQUESTED_TRANSPORT, USERNAME, XOR_RELAYED_ADDRESS,
+    DATA, ERROR_CODE, NONCE, REALM, REQUESTED_TRANSPORT, USERNAME, XOR_PEER_ADDRESS,
+    XOR_RELAYED_ADDRESS,
 };
-use outpost::stun::{self, ALLOCATE, BINDING, Builder, Class, Message, long_term_key};
+use outpost::stun::{
+    self, ALLOCATE, BINDING, Builder, CREATE_PERMISSION, Class, Message, SEND, long_term_key,
+};
 use outpost::{Config, Credentials, Outpost};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -196,35 +199,48 @@ impl Line {
         Line::Tcp(TcpStream::connect(server).await.unwrap())
     }
 
-    async fn ask(&mut self, request: &[u8]) -> Vec<u8> {
+    async fn put(&mut self, message: &[u8]) {
         match self {
             Line::Udp(socket, server) => {
-                socket.send_to(request, *server).await.unwrap();
+                socket.send_to(message, *server).await.unwrap();
+            }
+            Line::Tcp(stream) => stream.write_all(message).await.unwrap(),
+        }
+    }
+
+    /// The next message outpost sends this way.
+    async fn next(&mut self) -> Vec<u8> {
+        match self {
+            Line::Udp(socket, _) => {
                 let mut datagram = vec![0; 2048];
                 let size = within(socket.recv(&mut datagram)).await.unwrap();
                 datagram.truncate(size);
                 datagram
             }
             Line::Tcp(stream) => {
-                stream.write_all(request).await.unwrap();
-                let mut reply = vec![0; stun::HEADER_LEN];
-                within(stream.read_exact(&mut reply)).await.unwrap();
-                reply.resize(stun::message_length(&reply).unwrap(), 0);
-                within(stream.read_exact(&mut reply[stun::HEADER_LEN..]))
+                let mut message = vec![0; stun::HEADER_LEN];
+                within(stream.read_exact(&mut message)).await.unwrap();
+                message.resize(stun::message_length(&message).unwrap(), 0);
+                within(stream.read_exact(&mut message[stun::HEADER_LEN..]))
                     .await
                     .unwrap();
-                reply
+                message
             }
         }
     }
 
-    /// Allocates as a browser does: unsigned first, then signed with the nonce it was given.
+    async fn ask(&mut self, request: &[u8]) -> Vec<u8> {
+        self.put(request).await;
+        self.next().await
+    }
+
+    /// Asks as a browser does: unsigned first, then signed with the nonce it was given.
     /// Answers the final reply.
-    async fn allocate(&mut self, room: &Credentials) -> Vec<u8> {
-        let request = |transaction| {
-            Builder::new(ALLOCATE, Class::Request, transaction)
-                .attribute(REQUESTED_TRANSPORT, &[17, 0, 0, 0])
-        };
+    async fn ask_logged_in(
+        &mut self,
+        room: &Credentials,
+        request: impl Fn(stun::Transaction) -> Builder,
+    ) -> Vec<u8> {
         let challenge = self.ask(&request(*b"first-try!!!").build()).await;
         let challenge = Message::parse(&challenge).unwrap();
         assert_eq!(error_code(&challenge), Some(401));
@@ -236,6 +252,33 @@ impl Line {
             .integrity(&key)
             .fingerprint();
         self.ask(&signed).await
+    }
+
+    async fn allocate(&mut self, room: &Credentials) -> Vec<u8> {
+        self.ask_logged_in(room, |transaction| {
+            Builder::new(ALLOCATE, Class::Request, transaction)
+                .attribute(REQUESTED_TRANSPORT, &[17, 0, 0, 0])
+        })
+        .await
+    }
+
+    /// Allocates and answers the relayed address.
+    async fn relayed(&mut self, room: &Credentials) -> SocketAddr {
+        let reply = self.allocate(room).await;
+        Message::parse(&reply)
+            .unwrap()
+            .xor_address(XOR_RELAYED_ADDRESS)
+            .unwrap()
+    }
+
+    async fn permit(&mut self, room: &Credentials, peer: SocketAddr) {
+        let reply = self
+            .ask_logged_in(room, |transaction| {
+                Builder::new(CREATE_PERMISSION, Class::Request, transaction)
+                    .xor_address(XOR_PEER_ADDRESS, peer)
+            })
+            .await;
+        assert_eq!(Message::parse(&reply).unwrap().class(), Class::Success);
     }
 }
 
@@ -292,4 +335,56 @@ async fn a_closed_tcp_connection_gives_its_place_in_the_room_back() {
         }
     })
     .await;
+}
+
+#[tokio::test]
+async fn game_data_crosses_between_a_udp_player_and_a_tcp_player() {
+    let outpost = start("test").await;
+    let mut over_udp = Line::udp(outpost.udp).await;
+    let mut over_tcp = Line::tcp(outpost.tcp).await;
+    let udp_relayed = over_udp.relayed(&outpost.room).await;
+    let tcp_relayed = over_tcp.relayed(&outpost.room).await;
+    over_udp.permit(&outpost.room, tcp_relayed).await;
+    over_tcp.permit(&outpost.room, udp_relayed).await;
+
+    carries(
+        &mut over_udp,
+        udp_relayed,
+        &mut over_tcp,
+        tcp_relayed,
+        b"over udp",
+    )
+    .await;
+    carries(
+        &mut over_tcp,
+        tcp_relayed,
+        &mut over_udp,
+        udp_relayed,
+        b"over tcp",
+    )
+    .await;
+}
+
+/// Sends `data` from one player to the other and checks it arrives as a Data indication from
+/// the sender's relayed address.
+async fn carries(
+    from: &mut Line,
+    from_relayed: SocketAddr,
+    to: &mut Line,
+    to_relayed: SocketAddr,
+    data: &[u8],
+) {
+    let send = Builder::new(SEND, Class::Indication, *b"send-it-on!!")
+        .xor_address(XOR_PEER_ADDRESS, to_relayed)
+        .attribute(DATA, data)
+        .build();
+    from.put(&send).await;
+    let arrived = to.next().await;
+    let arrived = Message::parse(&arrived).unwrap();
+    assert_eq!(
+        (arrived.method(), arrived.class()),
+        (stun::DATA, Class::Indication)
+    );
+    assert_eq!(arrived.xor_address(XOR_PEER_ADDRESS), Some(from_relayed));
+    assert_eq!(arrived.attribute(DATA), Some(data));
 }

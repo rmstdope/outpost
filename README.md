@@ -5,13 +5,18 @@ TURN relay for NESER network play. When two players' networks cannot be connecte
 through outpost instead. outpost relays only between the two players of one room, never to any
 other address. How it gets there is in [PLAN.md](PLAN.md).
 
-So far outpost is a STUN server (RFC 8489) that also hands out TURN allocations (RFC 8656):
+outpost is a STUN server (RFC 8489) and a TURN relay (RFC 8656) whose relaying never leaves the
+room:
 - a Binding request is answered with the address it came from, which tells a browser its public
   address;
 - Allocate and Refresh need a room's credentials (the long-term credential mechanism, realm
   `outpost`). A room is one username and password, shared by its two players, and holds at
   most eight allocations: a browser allocates once per TURN URL and network interface, and a
-  reloaded page leaves its old allocation behind until it expires. Relaying data between them comes in PLAN.md step 4b.
+  reloaded page leaves its old allocation behind until it expires;
+- data sent with a Send indication reaches another allocation of the same room as a Data
+  indication, if each has a CreatePermission for the other. Anything else is dropped: data
+  never goes to any other address, inside the VPS or on the internet. ChannelBind comes in
+  PLAN.md step 4c.
 
 How it answers, over UDP and TCP alike:
 - every response ends in a FINGERPRINT and names `outpost` as its SOFTWARE;
@@ -21,6 +26,9 @@ How it answers, over UDP and TCP alike:
   Attribute) naming it;
 - a TURN request without a valid login is challenged with a 401 carrying the realm and a nonce.
   The nonce is tied to the client's address and transport and lasts an hour, then draws a 438;
+- a permission is for an IPv4 address and lasts five minutes unless renewed. An allocation
+  holds at most 64. Every relayed address shares `OUTPOST_PUBLIC_IP`, so the room rule is
+  applied when data is sent, not when permissions are given;
 - an allocation is UDP over IPv4 only. It lasts 10 minutes unless the client asks for longer
   (at most an hour), and it ends with a Refresh of lifetime 0, or when its TCP connection
   closes. Relayed ports are picked at random from 49152–65535. Nothing listens on them,
