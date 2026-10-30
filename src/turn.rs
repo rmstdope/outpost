@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
+use crate::limit::{Limiter, Limits};
 use crate::relay::{self, Client, Outgoing, Relay, Transport};
 use crate::stun::{self, CHANNEL_DATA_HEADER_LEN, HEADER_LEN};
 
@@ -29,23 +30,52 @@ pub struct Network {
     pub relay: Mutex<Relay>,
     pub udp: UdpSocket,
     tcp: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
+    tcp_slots: Mutex<Slots>,
+    udp_answers: Mutex<Limiter<IpAddr>>,
+    limits: Limits,
+}
+
+/// TCP connections open, in all and per IP address.
+#[derive(Default)]
+struct Slots {
+    total: usize,
+    per_address: HashMap<IpAddr, usize>,
 }
 
 pub type Shared = Arc<Network>;
 
 impl Network {
-    pub fn new(relay: Relay, udp: UdpSocket) -> Shared {
+    pub fn new(relay: Relay, udp: UdpSocket, limits: Limits) -> Shared {
         Arc::new(Network {
             relay: Mutex::new(relay),
             udp,
             tcp: Mutex::default(),
+            tcp_slots: Mutex::default(),
+            udp_answers: Mutex::new(Limiter::new(
+                limits.udp_answers,
+                limits.udp_answer_addresses,
+            )),
+            limits,
         })
     }
 
     async fn receive(&self, message: &[u8], client: Client) {
-        if let Some(outgoing) = relay::handle(&self.relay, message, client, Instant::now()) {
-            self.deliver(outgoing).await;
+        let now = Instant::now();
+        let Some(outgoing) = relay::handle(&self.relay, message, client, now) else {
+            return;
+        };
+        // An answer over UDP may be going to a forged source (`Limits::udp_answers`).
+        let answer_over_udp = outgoing.to == client && client.transport == Transport::Udp;
+        if answer_over_udp
+            && !self
+                .udp_answers
+                .lock()
+                .unwrap()
+                .allow(client.address.ip(), now)
+        {
+            return;
         }
+        self.deliver(outgoing).await;
     }
 
     /// Sends a message on its way. One that cannot be delivered is the client's loss, not the
@@ -92,12 +122,53 @@ pub async fn serve_tcp(listener: TcpListener, network: Shared) -> io::Result<()>
     loop {
         match listener.accept().await {
             Ok((stream, from)) => {
-                tokio::spawn(connection(stream, from, network.clone()));
+                // Beyond the limits the connection is dropped, and so closed, at once.
+                if let Some(slot) = Slot::take(&network, from.ip()) {
+                    tokio::spawn(connection(stream, from, network.clone(), slot));
+                }
             }
             // Out of file descriptors, most likely: wait for connections to close.
             Err(error) => {
                 tracing::warn!("accepting a TCP connection failed: {error}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// One of an address's TCP connections (`Limits::tcp_connections_per_address`); its place is
+/// given back when it is dropped.
+struct Slot {
+    network: Shared,
+    address: IpAddr,
+}
+
+impl Slot {
+    fn take(network: &Shared, address: IpAddr) -> Option<Slot> {
+        let mut slots = network.tcp_slots.lock().unwrap();
+        let from_address = slots.per_address.get(&address).copied().unwrap_or(0);
+        if slots.total >= network.limits.tcp_connections
+            || from_address >= network.limits.tcp_connections_per_address
+        {
+            return None;
+        }
+        slots.total += 1;
+        slots.per_address.insert(address, from_address + 1);
+        Some(Slot {
+            network: network.clone(),
+            address,
+        })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut slots = self.network.tcp_slots.lock().unwrap();
+        slots.total -= 1;
+        if let Some(count) = slots.per_address.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                slots.per_address.remove(&self.address);
             }
         }
     }
@@ -109,7 +180,7 @@ pub async fn serve_tcp(listener: TcpListener, network: Shared) -> io::Result<()>
 /// Clients are told apart by address, and a new connection can arrive from an address whose
 /// old connection has not been cleaned up yet. The new one takes the address over, ending the
 /// old one's allocation, and the old one cleans up only what is still its own.
-async fn connection(stream: TcpStream, from: SocketAddr, network: Shared) {
+async fn connection(stream: TcpStream, from: SocketAddr, network: Shared, _slot: Slot) {
     let client = Client {
         address: from,
         transport: Transport::Tcp,
@@ -149,38 +220,52 @@ async fn connection(stream: TcpStream, from: SocketAddr, network: Shared) {
     }
 }
 
-/// Over TCP, STUN and ChannelData messages follow each other with no other framing; the first
-/// four bytes tell which comes next and how long it is (RFC 8489 §6.2.2, RFC 8656 §12.5).
-/// Anything else, or a message longer than `MAX_MESSAGE`, ends the connection.
+/// Reads and handles messages until the connection ends, sends something that is not a
+/// message, or stays silent for `Limits::tcp_idle`.
 async fn messages(reader: &mut OwnedReadHalf, client: Client, network: &Network) -> io::Result<()> {
     let mut message = Vec::with_capacity(MAX_MESSAGE);
     loop {
-        message.resize(CHANNEL_DATA_HEADER_LEN, 0);
-        reader.read_exact(&mut message).await?;
-        let length = if stun::is_channel_data(&message) {
-            stun::channel_data_length(&message)
-        } else {
-            message.resize(HEADER_LEN, 0);
-            reader
-                .read_exact(&mut message[CHANNEL_DATA_HEADER_LEN..])
-                .await?;
-            stun::message_length(&message)
-        };
-        let Some(length) = length.filter(|length| *length <= MAX_MESSAGE) else {
-            return Ok(());
-        };
-        let read = message.len();
-        message.resize(length, 0);
-        reader.read_exact(&mut message[read..]).await?;
-        network.receive(&message, client).await;
+        match tokio::time::timeout(network.limits.tcp_idle, read(reader, &mut message)).await {
+            Ok(Ok(true)) => network.receive(&message, client).await,
+            Ok(Ok(false)) | Err(_) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+        }
     }
 }
 
-/// Forgets expired allocations every so often; until then they are only unreachable.
+/// Over TCP, STUN and ChannelData messages follow each other with no other framing; the first
+/// four bytes tell which comes next and how long it is (RFC 8489 §6.2.2, RFC 8656 §12.5).
+/// Answers whether `message` now holds one; anything else, or a message longer than
+/// `MAX_MESSAGE`, does not.
+async fn read(reader: &mut OwnedReadHalf, message: &mut Vec<u8>) -> io::Result<bool> {
+    message.resize(CHANNEL_DATA_HEADER_LEN, 0);
+    reader.read_exact(message).await?;
+    let length = if stun::is_channel_data(message) {
+        stun::channel_data_length(message)
+    } else {
+        message.resize(HEADER_LEN, 0);
+        reader
+            .read_exact(&mut message[CHANNEL_DATA_HEADER_LEN..])
+            .await?;
+        stun::message_length(message)
+    };
+    let Some(length) = length.filter(|length| *length <= MAX_MESSAGE) else {
+        return Ok(false);
+    };
+    let read = message.len();
+    message.resize(length, 0);
+    reader.read_exact(&mut message[read..]).await?;
+    Ok(true)
+}
+
+/// Forgets expired allocations, and addresses whose UDP answers have refilled, every so often.
+/// Until then expired allocations are only unreachable.
 pub async fn sweep(network: Shared) -> io::Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     loop {
         interval.tick().await;
-        network.relay.lock().unwrap().sweep(Instant::now());
+        let now = Instant::now();
+        network.relay.lock().unwrap().sweep(now);
+        network.udp_answers.lock().unwrap().sweep(now);
     }
 }

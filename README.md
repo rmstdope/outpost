@@ -47,6 +47,26 @@ cargo test                     # unit and end-to-end tests
 | `OUTPOST_REVISION` | `unknown` | Source commit served from `/release.json`; the image sets it at build time. |
 | `OUTPOST_PUBLIC_IP` | `127.0.0.1` | The IPv4 address players reach port 3478 at. Relayed addresses are given on it, so production must set it; the startup log shows the one in use. |
 
+## Limits
+
+Set in `src/limit.rs` (`Limits`); none can be changed without a new build.
+
+| Limit | Value | Beyond it |
+|---|---|---|
+| Allocations in a room | 8 | 486 |
+| Allocations from one IP address | 16 | 486 |
+| Allocations in all | 1000 | 508 |
+| Permissions, and channels, per allocation | 64 each | 508 |
+| Data one allocation relays | 256 KiB/s, bursts of 1 MiB | dropped |
+| TCP connections from one IP address, and in all | 16, and 1000 | closed at once |
+| A TCP connection sending nothing | 120 s | closed |
+| Answers over UDP to one IP address | 20 a second, bursts of 40 | dropped |
+| A message, over UDP or TCP | 2048 bytes | dropped, or the TCP connection closed |
+
+A game sends a few kilobytes a second, so the bandwidth leaves room for a ROM to cross in
+seconds. The UDP answer limit is there because a UDP source can be forged: without it,
+outpost could be used to flood someone else with its answers.
+
 ## Ports
 
 | Port | What |
